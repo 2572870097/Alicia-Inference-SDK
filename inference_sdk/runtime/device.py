@@ -4,6 +4,8 @@ from typing import Optional
 
 import torch
 
+from ..core.exceptions import DeviceUnavailableError
+
 logger = logging.getLogger(__name__)
 
 
@@ -49,7 +51,7 @@ def _mps_available() -> bool:
         return False
 
 
-def resolve_torch_device(requested_device: Optional[str] = None, strict: bool = False) -> DeviceSelection:
+def resolve_torch_device(requested_device: Optional[str] = None) -> DeviceSelection:
     requested = _normalize_device_name(requested_device)
 
     if requested.startswith("cuda"):
@@ -60,14 +62,7 @@ def resolve_torch_device(requested_device: Optional[str] = None, strict: bool = 
                 message = (
                     f"请求使用 `{requested}`，但当前只检测到 {device_count} 张 CUDA 设备。"
                 )
-                if strict:
-                    raise RuntimeError(message)
-                actual = "cuda:0"
-                return DeviceSelection(
-                    requested=requested,
-                    actual=actual,
-                    warning=f"{message} 已回退到 `{actual}`。",
-                )
+                raise DeviceUnavailableError(message)
 
             return DeviceSelection(requested=requested, actual=requested)
 
@@ -76,28 +71,10 @@ def resolve_torch_device(requested_device: Optional[str] = None, strict: bool = 
             f" torch.cuda.is_available()={torch.cuda.is_available()}，"
             f" torch.cuda.device_count()={device_count}。"
         )
-        if strict:
-            raise RuntimeError(message)
-
-        if _mps_available():
-            actual = "mps"
-        else:
-            actual = "cpu"
-
-        return DeviceSelection(
-            requested=requested,
-            actual=actual,
-            warning=f"{message} 已回退到 `{actual}`。",
-        )
+        raise DeviceUnavailableError(message)
 
     if requested == "mps" and not _mps_available():
         message = "请求使用 `mps`，但当前环境 MPS 不可用。"
-        if strict:
-            raise RuntimeError(message)
-        return DeviceSelection(
-            requested=requested,
-            actual="cpu",
-            warning=f"{message} 已回退到 `cpu`。",
-        )
+        raise DeviceUnavailableError(message)
 
     return DeviceSelection(requested=requested, actual=requested)

@@ -1,21 +1,21 @@
-# Examples
+# 示例
 
-[中文文档](README.zh-CN.md)
+[English](README.md)
 
-This directory only keeps one runnable example per inference algorithm:
+当前 `examples/` 目录只保留每种推理算法一个可直接运行的示例：
 
 - `examples/act.py`
 - `examples/pi0.py`
 - `examples/smolvla.py`
 
-Each example demonstrates the same recommended flow:
+这三个示例都展示同一套推荐流程：
 
-- build a v1 `PolicyLoadConfig`
-- load `InferenceSession` with `model_type`
-- print metadata and runtime status
-- run one `infer(...)` to get an action chunk
-- run one `step(...)`
-- cleanly stop and close the session
+- 构造 v1 `PolicyLoadConfig`
+- 按 `model_type` 加载 `InferenceSession`
+- 打印 metadata 和运行状态
+- 执行一次 `infer(...)` 获取 action chunk
+- 执行一次 `step(...)`
+- 正确停止并关闭 session
 
 ## ACT
 

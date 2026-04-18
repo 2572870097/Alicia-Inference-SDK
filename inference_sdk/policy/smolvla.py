@@ -1,20 +1,19 @@
 """
-PI0 (Vision-Language-Action) Inference Engine.
+SmolVLA (Vision-Language-Action) Inference Engine.
 
-Uses the SparkMind / LeRobot-compatible PI0 flow-matching policy for
-language-conditioned robot control.
+Uses VLM (SmolVLM2-500M-Video-Instruct) combined with Flow Matching
+action expert for robot control. Supports language-conditioned actions.
 
 Implements action queue based inference:
-- Predicts chunk_size actions at once using flow matching denoising
+- Predicts chunk_size actions at once using Flow Matching
 - Maintains action queue for smooth execution
-- Async prefetch and gripper smoothing via BaseInferenceEngine
+- Async prefetch and exponential blending
 """
 
 import json
 import logging
 import os
 from contextlib import contextmanager
-from dataclasses import fields
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional, Tuple
 
@@ -23,8 +22,9 @@ import numpy as np
 import torch
 import yaml
 
-from .base import BaseInferenceEngine, SmoothingConfig
-from .device import resolve_torch_device
+from ..core.exceptions import ResourceStateError, ValidationError
+from ..runtime.base import BaseInferenceEngine, SmoothingConfig
+from ..runtime.device import resolve_torch_device
 
 logger = logging.getLogger(__name__)
 
@@ -39,10 +39,7 @@ PRETRAINED_CHECKPOINT_FILES = ("config.json", "model.safetensors")
 PRETRAINED_SUBDIR_NAME = "pretrained_model"
 PREPROCESSOR_CONFIG_FILENAME = "policy_preprocessor.json"
 POSTPROCESSOR_CONFIG_FILENAME = "policy_postprocessor.json"
-DEFAULT_PI0_TOKENIZER = "google/paligemma2-3b-mix-224"
-PI0_TOKENIZER_ALIASES = {
-    "google/paligemma-3b-pt-224": DEFAULT_PI0_TOKENIZER,
-}
+DEFAULT_SMOLVLM_MODEL = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
 HF_PROXY_ENV_KEYS = (
     "HTTP_PROXY",
     "HTTPS_PROXY",
@@ -51,18 +48,17 @@ HF_PROXY_ENV_KEYS = (
     "https_proxy",
     "all_proxy",
 )
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _has_required_files(path: Path, filenames: tuple[str, ...]) -> bool:
     return path.is_dir() and all((path / name).is_file() for name in filenames)
 
 
-def _is_legacy_pi0_checkpoint(path: Path) -> bool:
+def _is_legacy_smolvla_checkpoint(path: Path) -> bool:
     return _has_required_files(path, LEGACY_CHECKPOINT_FILES)
 
 
-def _is_pretrained_pi0_dir(path: Path) -> bool:
+def _is_pretrained_smolvla_dir(path: Path) -> bool:
     return (
         _has_required_files(path, PRETRAINED_CHECKPOINT_FILES)
         and (
@@ -72,19 +68,19 @@ def _is_pretrained_pi0_dir(path: Path) -> bool:
     )
 
 
-def _resolve_pi0_checkpoint_dir(checkpoint_dir: str) -> Path:
+def _resolve_smolvla_checkpoint_dir(checkpoint_dir: str) -> Path:
     path = Path(checkpoint_dir)
-    if _is_pretrained_pi0_dir(path):
+    if _is_pretrained_smolvla_dir(path):
         return path
 
     pretrained_dir = path / PRETRAINED_SUBDIR_NAME
-    if _is_pretrained_pi0_dir(pretrained_dir):
+    if _is_pretrained_smolvla_dir(pretrained_dir):
         return pretrained_dir
 
     return path
 
 
-def _convert_pretrained_pi0_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
+def _convert_pretrained_smolvla_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
     input_features = config_dict.get("input_features") or {}
     output_features = config_dict.get("output_features") or {}
 
@@ -118,7 +114,6 @@ def _convert_pretrained_pi0_config(config_dict: Dict[str, Any]) -> Dict[str, Any
     inference_config["env_state_feature"] = env_state_feature
     inference_config["action_feature"] = action_feature
     inference_config["image_features"] = image_features
-
     return inference_config
 
 
@@ -138,7 +133,7 @@ def _extract_stats_from_safetensors(state_path: Path) -> Dict[str, Dict[str, Any
     return stats
 
 
-def _load_pretrained_pi0_stats(checkpoint_path: Path) -> Dict[str, Dict[str, Any]]:
+def _load_pretrained_smolvla_stats(checkpoint_path: Path) -> Dict[str, Dict[str, Any]]:
     stats: Dict[str, Dict[str, Any]] = {}
 
     for config_name in (PREPROCESSOR_CONFIG_FILENAME, POSTPROCESSOR_CONFIG_FILENAME):
@@ -168,16 +163,23 @@ def _load_pretrained_pi0_stats(checkpoint_path: Path) -> Dict[str, Dict[str, Any
     return stats
 
 
-def _load_pi0_state_dict(checkpoint_path: Path, device: torch.device) -> Dict[str, torch.Tensor]:
+def _load_smolvla_state_dict(checkpoint_path: Path, device: torch.device) -> Dict[str, torch.Tensor]:
     safetensors_path = checkpoint_path / "model.safetensors"
     if safetensors_path.is_file():
         if load_safetensors_file is None:
             raise RuntimeError("缺少 safetensors 依赖，无法读取 model.safetensors")
 
         try:
-            return load_safetensors_file(str(safetensors_path), device=str(device))
+            state_dict = load_safetensors_file(str(safetensors_path), device=str(device))
         except Exception:
-            return load_safetensors_file(str(safetensors_path), device="cpu")
+            state_dict = load_safetensors_file(str(safetensors_path), device="cpu")
+
+        if any(key.startswith("model.") for key in state_dict):
+            state_dict = {
+                key.removeprefix("model."): value
+                for key, value in state_dict.items()
+            }
+        return state_dict
 
     model_path = checkpoint_path / "model.pth"
     try:
@@ -187,120 +189,40 @@ def _load_pi0_state_dict(checkpoint_path: Path, device: torch.device) -> Dict[st
 
 
 def _is_local_model_dir(path: Path) -> bool:
-    return path.is_dir() and (
-        (path / "tokenizer_config.json").is_file()
-        or (path / "tokenizer.json").is_file()
-        or (path / "config.json").is_file()
-    )
+    return path.is_dir() and (path / "config.json").is_file()
 
 
-def _normalize_pi0_tokenizer_name(tokenizer_name: Optional[str]) -> str:
-    if not isinstance(tokenizer_name, str):
-        return DEFAULT_PI0_TOKENIZER
+def _resolve_vlm_model_source(vlm_model_name: str, checkpoint_path: Path) -> str:
+    env_override = os.environ.get("SMOLVLA_VLM_MODEL_PATH")
+    candidate_paths = []
 
-    normalized = tokenizer_name.strip()
-    if not normalized:
-        return DEFAULT_PI0_TOKENIZER
+    if env_override:
+        candidate_paths.append(Path(env_override).expanduser())
 
-    aliased = PI0_TOKENIZER_ALIASES.get(normalized)
-    if aliased is not None:
-        logger.info("Remapping legacy PI0 tokenizer %s -> %s", normalized, aliased)
-        return aliased
+    configured_path = Path(vlm_model_name).expanduser()
+    if configured_path.exists():
+        candidate_paths.append(configured_path)
 
-    return normalized
-
-
-def _candidate_pi0_tokenizer_names(requested_tokenizer: str) -> tuple[str, ...]:
-    candidates = [requested_tokenizer]
-    for legacy_name, canonical_name in PI0_TOKENIZER_ALIASES.items():
-        if canonical_name == requested_tokenizer and legacy_name not in candidates:
-            candidates.append(legacy_name)
-    return tuple(candidates)
-
-
-def _read_pi0_tokenizer_name(checkpoint_path: Path) -> str:
-    preprocessor_path = checkpoint_path / PREPROCESSOR_CONFIG_FILENAME
-    if not preprocessor_path.is_file():
-        return DEFAULT_PI0_TOKENIZER
-
-    try:
-        with open(preprocessor_path, "r") as f:
-            processor_config = json.load(f)
-    except Exception as exc:
-        logger.warning("Failed to read PI0 preprocessor config %s: %s", preprocessor_path, exc)
-        return DEFAULT_PI0_TOKENIZER
-
-    for step in processor_config.get("steps", []):
-        if step.get("registry_name") != "tokenizer_processor":
-            continue
-        tokenizer_name = (step.get("config") or {}).get("tokenizer_name")
-        if isinstance(tokenizer_name, str) and tokenizer_name.strip():
-            return _normalize_pi0_tokenizer_name(tokenizer_name)
-
-    return DEFAULT_PI0_TOKENIZER
-
-
-def _add_relative_model_candidates(candidate_paths: list[Path], base_dir: Path, tokenizer_name: str) -> None:
-    repo_path = Path(*tokenizer_name.split("/"))
+    repo_path = Path(*vlm_model_name.split("/"))
     candidate_paths.extend(
         [
-            base_dir / repo_path,
-            base_dir / repo_path.name,
+            checkpoint_path / "vlm_model",
+            checkpoint_path / repo_path,
+            checkpoint_path / repo_path.name,
+            checkpoint_path.parent / repo_path,
+            checkpoint_path.parent / repo_path.name,
+            Path.cwd() / "models" / repo_path,
+            Path.cwd() / "models" / repo_path.name,
         ]
     )
 
-
-def _resolve_pi0_tokenizer_source(checkpoint_path: Path, tokenizer_path: Optional[str] = None) -> str:
-    requested_tokenizer = _normalize_pi0_tokenizer_name(_read_pi0_tokenizer_name(checkpoint_path))
-    env_override = os.environ.get("PI0_TOKENIZER_PATH")
-    candidate_paths: list[Path] = []
-
-    for override in (tokenizer_path, env_override):
-        if not override:
-            continue
-        explicit_path = Path(override).expanduser()
-        candidate_paths.append(explicit_path)
-        if not explicit_path.is_absolute():
-            candidate_paths.extend(
-                [
-                    PROJECT_ROOT / explicit_path,
-                    Path.cwd() / explicit_path,
-                ]
-            )
-
-    candidate_paths.append(checkpoint_path / "tokenizer")
-
-    model_roots = [
-        checkpoint_path,
-        checkpoint_path.parent,
-        PROJECT_ROOT / "models",
-        Path.cwd() / "models",
-    ]
-    if len(checkpoint_path.parents) > 1:
-        model_roots.append(checkpoint_path.parents[1])
-    if len(checkpoint_path.parents) > 2:
-        model_roots.append(checkpoint_path.parents[2] / "models")
-
-    seen_roots: set[Path] = set()
-    for base_dir in model_roots:
-        base_dir = base_dir.expanduser()
-        if base_dir in seen_roots:
-            continue
-        seen_roots.add(base_dir)
-        for tokenizer_name in _candidate_pi0_tokenizer_names(requested_tokenizer):
-            _add_relative_model_candidates(candidate_paths, base_dir, tokenizer_name)
-
-    seen_candidates: set[Path] = set()
     for candidate in candidate_paths:
         candidate = candidate.expanduser().resolve()
-        if candidate in seen_candidates:
-            continue
-        seen_candidates.add(candidate)
         if _is_local_model_dir(candidate):
-            logger.info("Using local PI0 tokenizer assets from %s", candidate)
+            logger.info("Using local SmolVLM assets from %s", candidate)
             return str(candidate)
 
-    return requested_tokenizer
+    return vlm_model_name
 
 
 @contextmanager
@@ -322,7 +244,7 @@ def _normalized_hf_proxy_env() -> Iterator[None]:
             os.environ[key] = value
 
 
-def _format_pi0_load_error(error: Exception, requested_tokenizer: str) -> str:
+def _format_smolvla_load_error(error: Exception, requested_vlm: str) -> str:
     message = str(error)
 
     if "Unknown scheme for proxy URL" in message and "socks://" in message:
@@ -331,158 +253,95 @@ def _format_pi0_load_error(error: Exception, requested_tokenizer: str) -> str:
             "请改成 `socks5://127.0.0.1:7897/`，或者临时取消 `ALL_PROXY` 后重启后端。"
         )
 
-    if "Can't load tokenizer" in message or "Can't load the tokenizer" in message:
+    if "Can't load the configuration of" in message:
         return (
-            "模型加载失败: PI0 tokenizer 未就绪。当前需要加载 "
-            f"`{requested_tokenizer}`。如果你要离线推理，请先下载该 tokenizer，例如:\n"
-            f"`source .venv/bin/activate && hf download {requested_tokenizer} "
-            f"--local-dir models/{requested_tokenizer}`\n"
-            "然后任选其一:\n"
-            f"`export PI0_TOKENIZER_PATH=/home/ubuntu/DataCollection/models/{requested_tokenizer}`\n"
-            "或在前端 PI0 模型加载面板里直接填写 Tokenizer 路径。"
-        )
-
-    if (
-        "gated repo" in message.lower()
-        or "Cannot access gated repo" in message
-        or "401 Client Error" in message
-        or ("Access to model " in message and " is restricted" in message)
-    ):
-        return (
-            f"模型加载失败: 当前 PI0 需要的 tokenizer `{requested_tokenizer}` 是 Hugging Face 受限仓库，"
-            "你当前环境既没有本地 tokenizer 文件，也没有可用的 HF 授权。\n"
-            "可选解决方案:\n"
-            "1. 使用有权限的 Hugging Face 账号登录并下载 tokenizer:\n"
-            "`source .venv/bin/activate && hf auth login`\n"
-            f"`hf download {requested_tokenizer} --local-dir models/{requested_tokenizer}`\n"
-            "2. 如果这台机器不方便联网，可在另一台已获授权的机器下载后，把整个目录拷贝到:\n"
-            f"`/home/ubuntu/DataCollection/models/{requested_tokenizer}`\n"
-            "3. 然后任选其一:\n"
-            f"`export PI0_TOKENIZER_PATH=/home/ubuntu/DataCollection/models/{requested_tokenizer}`\n"
-            "或在前端 PI0 模型加载面板里直接填写 Tokenizer 路径。\n"
-            "补充说明: 你当前的 PI0 checkpoint 目录只包含模型权重和 processor/stats，不包含 tokenizer 资产。"
+            "模型加载失败: SmolVLA 基础视觉语言模型未就绪。当前需要加载 "
+            f"`{requested_vlm}`。如果你要离线推理，请先下载该模型，例如:\n"
+            "`source .venv/bin/activate && hf download HuggingFaceTB/SmolVLM2-500M-Video-Instruct "
+            "--local-dir models/HuggingFaceTB/SmolVLM2-500M-Video-Instruct`\n"
+            "然后设置环境变量:\n"
+            "`export SMOLVLA_VLM_MODEL_PATH=/home/ubuntu/DataCollection/models/HuggingFaceTB/SmolVLM2-500M-Video-Instruct`\n"
+            "再重新启动后端。"
         )
 
     if "Operation not permitted" in message:
         return (
             "模型加载失败: 当前环境无法访问 Hugging Face。请检查网络/代理，"
-            "或者先把 PI0 tokenizer 下载到本地，并通过 `PI0_TOKENIZER_PATH` 指向它。"
+            "或者先把 SmolVLM2 基础模型下载到本地，并通过 `SMOLVLA_VLM_MODEL_PATH` 指向它。"
         )
 
     return f"模型加载失败: {message}"
 
-
-PI0_AVAILABLE = False
+# Try to import SparkMind SmolVLA model
+SMOLVLA_AVAILABLE = False
 try:
+    from omegaconf import OmegaConf
+    from sparkmind.learning.VLA.models.smolvla_model import VLAFlowMatching
+    from sparkmind.lerobot_compat.policies.smolvla.configuration_smolvla import SmolVLAConfig
     from transformers import AutoTokenizer
-
-    from sparkmind.lerobot_compat.configs.types import FeatureType, NormalizationMode, PolicyFeature
-    from sparkmind.lerobot_compat.policies.pi0.configuration_pi0 import PI0Config
-    from sparkmind.lerobot_compat.policies.pi0.modeling_pi0 import PI0Policy
-    from sparkmind.learning.VLA.models.pi0_model import PI0Pytorch
-
-    PI0_AVAILABLE = True
-    logger.info("SparkMind PI0 model loaded successfully")
+    SMOLVLA_AVAILABLE = True
+    logger.info("SparkMind SmolVLA model loaded successfully")
 except Exception as e:
-    logger.warning("SparkMind PI0 model not available: %s", e)
+    logger.warning(f"SparkMind SmolVLA model not available: {e}")
 
 
-def _coerce_policy_feature_map(feature_map: Dict[str, Any]) -> Dict[str, Any]:
-    if not PI0_AVAILABLE:
-        return feature_map
-
-    coerced: Dict[str, Any] = {}
-    for key, value in feature_map.items():
-        if isinstance(value, PolicyFeature):
-            coerced[key] = value
-            continue
-        if isinstance(value, dict) and "type" in value and "shape" in value:
-            coerced[key] = PolicyFeature(
-                type=FeatureType(str(value["type"]).upper()),
-                shape=tuple(value["shape"]),
-            )
-        else:
-            coerced[key] = value
-    return coerced
-
-
-def _coerce_pi0_config_dict(config_dict: Dict[str, Any], device: str) -> Dict[str, Any]:
-    if not PI0_AVAILABLE:
-        return config_dict
-
-    accepted_keys = {f.name for f in fields(PI0Config)}
-    filtered_config = {k: v for k, v in config_dict.items() if k in accepted_keys}
-    filtered_config["device"] = device
-
-    if "image_resolution" in filtered_config and isinstance(filtered_config["image_resolution"], list):
-        filtered_config["image_resolution"] = tuple(filtered_config["image_resolution"])
-
-    if "input_features" in filtered_config and isinstance(filtered_config["input_features"], dict):
-        filtered_config["input_features"] = _coerce_policy_feature_map(filtered_config["input_features"])
-
-    if "output_features" in filtered_config and isinstance(filtered_config["output_features"], dict):
-        filtered_config["output_features"] = _coerce_policy_feature_map(filtered_config["output_features"])
-
-    if "normalization_mapping" in filtered_config and isinstance(filtered_config["normalization_mapping"], dict):
-        filtered_config["normalization_mapping"] = {
-            key: value if isinstance(value, NormalizationMode) else NormalizationMode(str(value))
-            for key, value in filtered_config["normalization_mapping"].items()
-        }
-
-    return filtered_config
-
-
-class PI0InferenceEngine(BaseInferenceEngine):
+class SmolVLAInferenceEngine(BaseInferenceEngine):
     """
-    PI0 (Vision-Language-Action) inference engine.
-
-    Uses the PI0 flow-matching model to predict action chunks from images,
-    language instruction and robot state.
+    SmolVLA (Vision-Language-Action) inference engine.
+    
+    Uses VLM (SmolVLM2-500M-Video-Instruct) combined with Flow Matching
+    action expert for robot control. Supports language-conditioned actions.
+    
+    Implements action queue based inference:
+    - Predicts chunk_size actions at once using Flow Matching
+    - Maintains action queue for smooth execution
+    - Async prefetch and exponential blending
     """
-
+    
     def __init__(
         self,
         device: str = "cuda:0",
         smoothing_config: Optional[SmoothingConfig] = None,
-        strict_device: bool = False,
     ):
         super().__init__(smoothing_config)
-        self.model_type = "pi0"
+        self.model_type = "smolvla"
 
-        device_selection = resolve_torch_device(device, strict=strict_device)
+        device_selection = resolve_torch_device(device)
         self.requested_device = device_selection.requested
         self.actual_device = device_selection.actual
         self.device_warning = device_selection.warning
         if self.device_warning:
             logger.warning(self.device_warning)
         self.device = torch.device(self.actual_device)
-
+        
         self.model: Optional[Any] = None
         self.config: Optional[Any] = None
-        self.config_dict: Optional[Dict[str, Any]] = None
-        self.stats: Optional[Dict[str, Dict[str, Any]]] = None
+        self.config_dict: Optional[Dict] = None
+        self.stats: Optional[Dict] = None
         self.tokenizer: Optional[Any] = None
-        self.tokenizer_source: Optional[str] = None
-
+        
+        # Camera role mapping
         self._camera_key_to_role: Dict[str, str] = {}
         self._role_to_camera_key: Dict[str, str] = {}
         self._camera_alias_to_key: Dict[str, str] = {}
-
+        
+        # Language instruction (required for SmolVLA)
         self._instruction: str = "Pick up the object."
         self._instruction_tokens: Optional[torch.Tensor] = None
         self._instruction_attention_mask: Optional[torch.Tensor] = None
-
-        self._image_resize: Optional[Tuple[int, int]] = (224, 224)
+        
+        # Image resize target for SmolVLA. If None, keep native resolution.
+        self._image_resize: Optional[Tuple[int, int]] = (512, 512)
 
     @staticmethod
     def validate_checkpoint(checkpoint_dir: str) -> Tuple[bool, str]:
-        """Validate that checkpoint directory contains a supported PI0 checkpoint format."""
+        """Validate that checkpoint directory contains a supported SmolVLA checkpoint format."""
         raw_path = Path(checkpoint_dir)
         if not raw_path.exists():
             return False, f"Checkpoint目录不存在: {checkpoint_dir}"
 
-        resolved_path = _resolve_pi0_checkpoint_dir(checkpoint_dir)
-        if _is_legacy_pi0_checkpoint(resolved_path) or _is_pretrained_pi0_dir(resolved_path):
+        resolved_path = _resolve_smolvla_checkpoint_dir(checkpoint_dir)
+        if _is_legacy_smolvla_checkpoint(resolved_path) or _is_pretrained_smolvla_dir(resolved_path):
             return True, ""
 
         legacy_missing = [name for name in LEGACY_CHECKPOINT_FILES if not (resolved_path / name).is_file()]
@@ -494,7 +353,7 @@ class PI0InferenceEngine(BaseInferenceEngine):
         ]
         return (
             False,
-            "PI0模型目录格式不受支持。"
+            "SmolVLA模型目录格式不受支持。"
             f" 旧格式需要: {', '.join(LEGACY_CHECKPOINT_FILES)}"
             f"；导出格式需要: {', '.join(PRETRAINED_CHECKPOINT_FILES)}"
             f" + 至少一个processor配置({PREPROCESSOR_CONFIG_FILENAME}/{POSTPROCESSOR_CONFIG_FILENAME})"
@@ -502,22 +361,22 @@ class PI0InferenceEngine(BaseInferenceEngine):
             f"；导出格式文件: {', '.join(exported_missing) or '无'}"
             f"；processor配置: {', '.join(processor_missing) or '无'}",
         )
-
-    def load(self, checkpoint_dir: str, tokenizer_path: Optional[str] = None) -> Tuple[bool, str]:
-        """Load PI0 model from checkpoint."""
-        if not PI0_AVAILABLE:
-            return False, "PI0模型依赖未安装 (SparkMind/transformers)"
-
+    
+    def load(self, checkpoint_dir: str) -> Tuple[bool, str]:
+        """Load SmolVLA model from checkpoint."""
+        if not SMOLVLA_AVAILABLE:
+            return False, "SmolVLA模型依赖未安装 (SparkMind/transformers)"
+        
+        # Validate
         valid, error = self.validate_checkpoint(checkpoint_dir)
         if not valid:
             return False, error
-
-        checkpoint_path = _resolve_pi0_checkpoint_dir(checkpoint_dir)
-        tokenizer_source = _resolve_pi0_tokenizer_source(checkpoint_path, tokenizer_path=tokenizer_path)
-        self.tokenizer_source = tokenizer_source
-
+        
+        checkpoint_path = _resolve_smolvla_checkpoint_dir(checkpoint_dir)
+        vlm_model_source = DEFAULT_SMOLVLM_MODEL
+        
         try:
-            if _is_legacy_pi0_checkpoint(checkpoint_path):
+            if _is_legacy_smolvla_checkpoint(checkpoint_path):
                 config_path = checkpoint_path / "inference_config.yaml"
                 with open(config_path, "r") as f:
                     self.config_dict = yaml.safe_load(f)
@@ -530,19 +389,23 @@ class PI0InferenceEngine(BaseInferenceEngine):
                 with open(config_path, "r") as f:
                     pretrained_config = json.load(f)
 
-                self.config_dict = _convert_pretrained_pi0_config(pretrained_config)
-                self.stats = _load_pretrained_pi0_stats(checkpoint_path)
-
+                self.config_dict = _convert_pretrained_smolvla_config(pretrained_config)
+                self.stats = _load_pretrained_smolvla_stats(checkpoint_path)
+            
+            # Parse camera requirements from image_features
             image_features = self.config_dict.get("image_features", [])
             self.required_cameras = []
             self._camera_key_to_role = {}
             self._role_to_camera_key = {}
             self._camera_alias_to_key = {}
-
+            
             for key in image_features:
                 if key.startswith("observation.images."):
                     suffix = key.replace("observation.images.", "")
-                    role = suffix[4:] if suffix.startswith("cam_") else suffix
+                    if suffix.startswith("cam_"):
+                        role = suffix[4:]  # Remove "cam_" prefix
+                    else:
+                        role = suffix
                     if role not in self.required_cameras:
                         self.required_cameras.append(role)
                     self._camera_key_to_role[key] = role
@@ -550,229 +413,321 @@ class PI0InferenceEngine(BaseInferenceEngine):
                     self._camera_alias_to_key[role] = key
                     self._camera_alias_to_key[suffix] = key
                     self._camera_alias_to_key[key] = key
-
+            
+            # Parse dimensions
             state_shape = self.config_dict.get("robot_state_feature", {}).get("shape", [7])
             action_shape = self.config_dict.get("action_feature", {}).get("shape", [7])
             self.state_dim = state_shape[0] if state_shape else 7
             self.action_dim = action_shape[0] if action_shape else 7
-            self.chunk_size = int(self.config_dict.get("chunk_size", 50))
-            self.n_action_steps = int(self.config_dict.get("n_action_steps", self.chunk_size))
-
-            pi0_config_kwargs = _coerce_pi0_config_dict(self.config_dict, str(self.device))
-            self.config = PI0Config(**pi0_config_kwargs)
-            self._image_resize = tuple(self.config.image_resolution) if self.config.image_resolution is not None else None
-
+            self.chunk_size = self.config_dict.get("chunk_size", 50)
+            self.n_action_steps = self.config_dict.get("n_action_steps", self.chunk_size)
+            
+            # Get VLM model name from config
+            vlm_model_name = self.config_dict.get("vlm_model_name", DEFAULT_SMOLVLM_MODEL)
+            vlm_model_source = _resolve_vlm_model_source(vlm_model_name, checkpoint_path)
+            
+            # Build SmolVLAConfig with only valid parameters from SmolVLAConfig dataclass
+            valid_config_keys = [
+                "n_obs_steps", "input_features", "output_features", "device", "use_amp", "use_peft",
+                "push_to_hub", "repo_id", "private", "tags", "license", "pretrained_path",
+                "chunk_size", "n_action_steps", "normalization_mapping",
+                "max_state_dim", "max_action_dim", "resize_imgs_with_padding", "empty_cameras",
+                "adapt_to_pi_aloha", "use_delta_joint_actions_aloha",
+                "tokenizer_max_length", "num_steps", "use_cache",
+                "freeze_vision_encoder", "train_expert_only", "train_state_proj",
+                "optimizer_lr", "optimizer_betas", "optimizer_eps", "optimizer_weight_decay",
+                "optimizer_grad_clip_norm", "scheduler_warmup_steps", "scheduler_decay_steps",
+                "scheduler_decay_lr",
+                "vlm_model_name", "add_image_special_tokens", "attention_mode",
+                "prefix_length", "pad_language_to", "num_expert_layers", "num_vlm_layers",
+                "self_attn_every_n_layers", "expert_width_multiplier",
+                "min_period", "max_period", "rtc_config", "compile_model", "compile_mode"
+            ]
+            filtered_config = {k: v for k, v in self.config_dict.items() if k in valid_config_keys}
+            filtered_config["load_vlm_weights"] = False  # Load from checkpoint instead
+            filtered_config["vlm_model_name"] = vlm_model_source
+            
+            # Handle tuple conversion for resize_imgs_with_padding
+            if "resize_imgs_with_padding" in filtered_config:
+                val = filtered_config["resize_imgs_with_padding"]
+                if isinstance(val, list):
+                    filtered_config["resize_imgs_with_padding"] = tuple(val)
+            
+            self.config = SmolVLAConfig(**filtered_config)
+            self._image_resize = self.config.resize_imgs_with_padding
+            
+            # Add rtc_config attribute if not present (required by VLAFlowMatching._rtc_enabled)
+            if not hasattr(self.config, 'rtc_config'):
+                self.config.rtc_config = None
+            
             with _normalized_hf_proxy_env():
+                # Initialize tokenizer
                 self.tokenizer = AutoTokenizer.from_pretrained(
-                    tokenizer_source,
+                    vlm_model_source,
                     trust_remote_code=True,
                 )
+                
+                # Initialize model
+                self.model = VLAFlowMatching(self.config)
 
-            self.model = PI0Pytorch(self.config, rtc_processor=None)
             self.model.to(self.device)
             self.model.eval()
-
-            original_state_dict = _load_pi0_state_dict(checkpoint_path, self.device)
-
-            class _PolicyShim:
-                __slots__ = ("model",)
-
-                def __init__(self, model):
-                    self.model = model
-
-            shim = _PolicyShim(self.model)
-            fixed_state_dict = PI0Policy._fix_pytorch_state_dict_keys(shim, original_state_dict, self.model.config)
-            inner_state_dict = {
-                (key[6:] if key.startswith("model.") else key): value
-                for key, value in fixed_state_dict.items()
-            }
-            missing_keys, unexpected_keys = self.model.load_state_dict(inner_state_dict, strict=False)
-
+            
+            # Load weights
+            state_dict = _load_smolvla_state_dict(checkpoint_path, self.device)
+            self.model.load_state_dict(state_dict)
+            
+            logger.info(f"SmolVLA model loaded from {checkpoint_dir}")
+            logger.info(f"Required cameras: {self.required_cameras}")
+            logger.info(f"State dim: {self.state_dim}, Action dim: {self.action_dim}")
+            logger.info(f"Chunk size: {self.chunk_size}, N action steps: {self.n_action_steps}")
+            logger.info(f"VLM: {vlm_model_source}")
+            
             self.is_loaded = True
+            
+            # Initialize smoothing components
             self._init_components()
             self.reset()
+            
+            # Pre-tokenize default instruction
             self._tokenize_instruction(self._instruction)
-
-            logger.info("PI0 model loaded from %s", checkpoint_dir)
-            logger.info("Required cameras: %s", self.required_cameras)
-            logger.info("State dim: %s, Action dim: %s", self.state_dim, self.action_dim)
-            logger.info("Chunk size: %s, N action steps: %s", self.chunk_size, self.n_action_steps)
-            logger.info("Tokenizer: %s", tokenizer_source)
-            logger.info(
-                "PI0 weights loaded with strict=False: missing=%s unexpected=%s",
-                len(missing_keys),
-                len(unexpected_keys),
-            )
-
+            
             return True, ""
-
+            
         except Exception as e:
-            logger.error("Failed to load PI0 model: %s", e)
+            logger.error(f"Failed to load SmolVLA model: {e}")
             import traceback
-
             traceback.print_exc()
-            return False, _format_pi0_load_error(e, tokenizer_source)
-
+            return False, _format_smolvla_load_error(e, vlm_model_source)
+    
     def set_instruction(self, instruction: str) -> bool:
-        """Set the language instruction for PI0."""
+        """
+        Set the language instruction for SmolVLA.
+        
+        Args:
+            instruction: Natural language instruction (e.g., "Pick up the apple")
+            
+        Returns:
+            True if successful
+        """
         if not self.is_loaded or self.tokenizer is None:
             logger.warning("Cannot set instruction: model not loaded")
             return False
-
+        
         self._instruction = instruction
         self._tokenize_instruction(instruction)
-
+        
+        # Reset action queue when instruction changes
         if self._action_queue is not None:
             self._action_queue.reset()
-
-        logger.info("Instruction set: %s", instruction)
+        
+        logger.info(f"Instruction set: {instruction}")
         return True
-
+    
     def get_instruction(self) -> str:
         """Get current instruction."""
         return self._instruction
-
+    
     def _tokenize_instruction(self, instruction: str):
-        """Tokenize instruction for PI0 input."""
+        """Tokenize instruction for model input."""
         if self.tokenizer is None:
             return
 
         instruction_text = instruction if instruction.endswith("\n") else f"{instruction}\n"
-        tokenizer_max_length = self.config.tokenizer_max_length if self.config is not None else 48
+        tokenizer_max_length = self.config.tokenizer_max_length if self.config is not None else 64
+        padding_mode = self.config.pad_language_to if self.config is not None else "max_length"
         self.tokenizer.padding_side = "right"
 
         tokens = self.tokenizer(
             instruction_text,
             return_tensors="pt",
-            padding="max_length",
+            padding=padding_mode,
             max_length=tokenizer_max_length,
-            truncation=True,
+            truncation=True
         )
         self._instruction_tokens = tokens["input_ids"].to(self.device)
+        # Convert attention mask to boolean as required by SmolVLA model
         self._instruction_attention_mask = tokens["attention_mask"].bool().to(self.device)
-
-    def _resize_with_pad(
-        self,
-        img: np.ndarray,
-        target_h: int,
-        target_w: int,
-        pad_value: int = 0,
-    ) -> np.ndarray:
+    
+    def _resize_with_pad(self, img: np.ndarray, target_h: int, target_w: int, 
+                         pad_value: int = 0) -> np.ndarray:
+        """
+        Resize image while maintaining aspect ratio and pad to target size.
+        
+        Args:
+            img: Input image (H, W, 3)
+            target_h: Target height
+            target_w: Target width
+            pad_value: Padding value
+            
+        Returns:
+            Resized and padded image (target_h, target_w, 3)
+        """
         h, w = img.shape[:2]
         scale = min(target_h / h, target_w / w)
         new_h, new_w = int(h * scale), int(w * scale)
-
+        
         resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        
+        # Create padded image
         padded = np.full((target_h, target_w, 3), pad_value, dtype=np.uint8)
-
+        
+        # Center the resized image
         y_offset = (target_h - new_h) // 2
         x_offset = (target_w - new_w) // 2
         padded[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = resized
+        
         return padded
-
+    
     def _preprocess_images(self, images: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
         """
-        Preprocess images for PI0 input.
-
-        PI0 expects images normalized to [-1, 1] and resized with padding to the
-        configured square resolution.
+        Preprocess images for SmolVLA model input.
+        
+        SmolVLA uses different preprocessing from ACT:
+        - Resize with padding to 512x512
+        - Normalize to [-1, 1] range (NOT ImageNet stats)
+        
+        Args:
+            images: Dict of {role: BGR numpy array (H, W, 3)}
+            
+        Returns:
+            Dict of {camera_key: normalized tensor (1, 3, H, W)}
         """
         processed = {}
-
+        
         for camera_alias, img_bgr in images.items():
             camera_key = self._camera_alias_to_key.get(camera_alias)
             if camera_key is None:
                 continue
-
+            
+            # BGR -> RGB
             img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-
+            
             if self._image_resize is not None:
                 target_h, target_w = self._image_resize
                 img_rgb = self._resize_with_pad(img_rgb, target_h, target_w, pad_value=0)
-
+            
+            # HWC -> CHW, normalize to [0, 1] then to [-1, 1]
             img_tensor = torch.from_numpy(img_rgb).permute(2, 0, 1).float() / 255.0
-            img_tensor = img_tensor * 2.0 - 1.0
+            img_tensor = img_tensor * 2.0 - 1.0  # [-1, 1] normalization
+            
+            # Add batch dimension
             img_tensor = img_tensor.unsqueeze(0).to(self.device)
             processed[camera_key] = img_tensor
-
+        
         return processed
-
+    
     def _preprocess_state(self, state: np.ndarray) -> torch.Tensor:
-        """Preprocess robot state for PI0 input."""
+        """
+        Preprocess robot state for model input.
+        
+        Args:
+            state: Robot state array (state_dim,) with gripper in [0, 1000]
+            
+        Returns:
+            Normalized state tensor (1, state_dim)
+        """
         state = state.copy()
-
+        
+        # Scale gripper from [0, 1000] to [0, 1]
         if len(state) >= 7:
             state[-1] = state[-1] / 1000.0
-
+        
         state_tensor = torch.from_numpy(state).float()
-
+        
+        # Normalize using stats
         if self.stats is not None and "observation.state" in self.stats:
             stats = self.stats["observation.state"]
             mean = torch.tensor(stats["mean"])
             std = torch.tensor(stats["std"])
             state_tensor = (state_tensor - mean) / (std + 1e-6)
-
+        
         return state_tensor.unsqueeze(0).to(self.device)
-
+    
     def _postprocess_action(self, action_tensor: torch.Tensor) -> np.ndarray:
-        """Postprocess PI0 normalized action tensor back to robot action space."""
+        """
+        Postprocess (unnormalize) action tensor.
+        
+        Args:
+            action_tensor: Normalized action tensor (action_dim,)
+            
+        Returns:
+            Unnormalized action array (action_dim,) with gripper scaled to [0, 1000]
+        """
         action = action_tensor.cpu()
-
+        
+        # Unnormalize using stats
         if self.stats is not None and "action" in self.stats:
             stats = self.stats["action"]
             mean = torch.tensor(stats["mean"])
             std = torch.tensor(stats["std"])
             action = action * std + mean
-
+        
         action = action.numpy()
-
+        
+        # Scale gripper from [0, 1] to [0, 1000]
         if len(action) >= 7:
             action[-1] = action[-1] * 1000.0
-
+        
         return action
-
+    
     @torch.no_grad()
     def _predict_chunk(self, images: Dict[str, np.ndarray], state: np.ndarray) -> np.ndarray:
         """
-        Internal method to predict a chunk of actions using PI0 flow matching.
-
+        Internal method to predict a chunk of actions using Flow Matching.
+        
         Returns:
             Action chunk (n_action_steps, action_dim) - unnormalized
         """
-        if self.model is None or self.config is None:
-            raise RuntimeError("Model not loaded")
-
-        if self._instruction_tokens is None or self._instruction_attention_mask is None:
-            raise RuntimeError("Instruction not set - call set_instruction() first")
-
+        if self.model is None:
+            raise ResourceStateError("SmolVLA model is not loaded")
+        
+        if self._instruction_tokens is None:
+            raise ResourceStateError("SmolVLA instruction is not set. Call set_instruction() first")
+        
+        # Preprocess inputs
         processed_images = self._preprocess_images(images)
         processed_state = self._preprocess_state(state)
-
+        
+        # Get image features as list (order matters)
         image_features = self.config_dict.get("image_features", [])
-        image_list = [processed_images[key] for key in image_features if key in processed_images]
+        image_list = [processed_images[key] for key in image_features 
+                     if key in processed_images]
         if not image_list:
-            raise RuntimeError("No valid images available for PI0 inference")
-
-        image_masks = [torch.ones(1, dtype=torch.bool, device=self.device) for _ in image_list]
-
+            raise ValidationError(
+                "No valid images available for SmolVLA inference",
+                details={"required_image_features": image_features},
+            )
+        
+        # Create image masks (all valid = True), one per camera
+        image_masks = [torch.ones(1, dtype=torch.bool, device=self.device) 
+                      for _ in image_list]
+        
+        # Pad state to max_state_dim (32)
         max_state_dim = self.config.max_state_dim
         padded_state = torch.zeros(1, max_state_dim, device=self.device)
         padded_state[0, :processed_state.shape[1]] = processed_state[0]
-
+        
+        # Sample actions using Flow Matching
         actions_chunk = self.model.sample_actions(
             images=image_list,
             img_masks=image_masks,
             lang_tokens=self._instruction_tokens,
             lang_masks=self._instruction_attention_mask,
             state=padded_state,
-        )
-
+        )  # (1, chunk_size, max_action_dim)
+        
+        # Take n_action_steps actions, only action_dim dimensions
         actions_normalized = actions_chunk[0, :self.n_action_steps, :self.action_dim]
-        actions = np.stack(
-            [self._postprocess_action(actions_normalized[i]) for i in range(actions_normalized.shape[0])]
-        )
+        
+        # Postprocess all actions
+        actions = np.stack([
+            self._postprocess_action(actions_normalized[i])
+            for i in range(actions_normalized.shape[0])
+        ])
+        
         return actions
-
+    
     def unload(self):
         """Unload model and free memory."""
         if self.model is not None:
@@ -781,15 +736,14 @@ class PI0InferenceEngine(BaseInferenceEngine):
         if self.tokenizer is not None:
             del self.tokenizer
             self.tokenizer = None
-        self.tokenizer_source = None
-
+        
         self.is_loaded = False
         self.reset()
-
+        
         self._instruction_tokens = None
         self._instruction_attention_mask = None
-
+        
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-
-        logger.info("PI0 model unloaded")
+        
+        logger.info("SmolVLA model unloaded")

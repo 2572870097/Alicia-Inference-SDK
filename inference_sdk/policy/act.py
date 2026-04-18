@@ -17,8 +17,9 @@ import numpy as np
 import torch
 import yaml
 
-from .base import BaseInferenceEngine, SmoothingConfig
-from .device import resolve_torch_device
+from ..core.exceptions import ResourceStateError
+from ..runtime.base import BaseInferenceEngine, SmoothingConfig
+from ..runtime.device import resolve_torch_device
 
 logger = logging.getLogger(__name__)
 
@@ -201,12 +202,11 @@ class ACTInferenceEngine(BaseInferenceEngine):
         self,
         device: str = "cuda:0",
         smoothing_config: Optional[SmoothingConfig] = None,
-        strict_device: bool = False,
     ):
         super().__init__(smoothing_config)
         self.model_type = "act"
 
-        device_selection = resolve_torch_device(device, strict=strict_device)
+        device_selection = resolve_torch_device(device)
         self.requested_device = device_selection.requested
         self.actual_device = device_selection.actual
         self.device_warning = device_selection.warning
@@ -466,7 +466,7 @@ class ACTInferenceEngine(BaseInferenceEngine):
             Action chunk (n_action_steps, action_dim) - unnormalized
         """
         if self.model is None or self.config is None:
-            raise RuntimeError("Model not loaded")
+            raise ResourceStateError("ACT model is not loaded")
         
         # Preprocess inputs
         processed_images = self._preprocess_images(images)

@@ -20,8 +20,14 @@ from typing import Callable, Dict, List, Optional, Tuple, Any
 
 import numpy as np
 
+from ..core.exceptions import (
+    InferenceError,
+    InstructionNotSupportedError,
+    ResourceStateError,
+    ValidationError,
+)
+from ..core.types import Observation, PolicyMetadata, PolicyStatus
 from .monitoring import get_inference_monitor
-from .types import Observation, PolicyMetadata, PolicyStatus
 
 logger = logging.getLogger(__name__)
 
@@ -757,6 +763,42 @@ class BaseInferenceEngine(ABC):
                 latency_estimator=self._latency_estimator,
                 trace_recorder=self._trace_recorder,
             )
+
+    def _require_loaded(self):
+        if not self.is_loaded:
+            raise ResourceStateError("Policy is not loaded")
+
+    def _require_runtime_ready(self):
+        if self._action_queue is None or self._latency_estimator is None:
+            raise ResourceStateError(
+                "Policy runtime is not initialized. Load the policy before running inference."
+            )
+
+    def _validate_images_state(self, images: Dict[str, np.ndarray], state: np.ndarray):
+        if not isinstance(images, dict):
+            raise ValidationError("`images` must be a dict of camera_role -> numpy.ndarray")
+        if not images:
+            raise ValidationError("`images` cannot be empty")
+
+        for camera_role, image in images.items():
+            if not isinstance(camera_role, str) or not camera_role.strip():
+                raise ValidationError("Image keys must be non-empty strings")
+            if not isinstance(image, np.ndarray):
+                raise ValidationError(f"Image `{camera_role}` must be a numpy.ndarray")
+            if image.ndim != 3 or image.shape[2] != 3:
+                raise ValidationError(
+                    f"Image `{camera_role}` must have shape (H, W, 3), got {tuple(image.shape)}"
+                )
+
+        if not isinstance(state, np.ndarray):
+            raise ValidationError("`state` must be a numpy.ndarray")
+        if state.ndim != 1:
+            raise ValidationError(f"`state` must be a 1D numpy.ndarray, got ndim={state.ndim}")
+
+    def _validate_observation(self, observation: Observation):
+        if not isinstance(observation, Observation):
+            raise ValidationError("`observation` must be an inference_sdk.Observation instance")
+        self._validate_images_state(observation.images, observation.state)
     
     @abstractmethod
     def load(self, checkpoint_dir: str) -> Tuple[bool, str]:
@@ -816,8 +858,9 @@ class BaseInferenceEngine(ABC):
         3. Apply gripper smoothing
         4. Increment timestep
         """
-        if not self.is_loaded:
-            raise RuntimeError("Model not loaded")
+        self._require_loaded()
+        self._require_runtime_ready()
+        self._validate_images_state(images, state)
         
         current_time = time.time()
         
@@ -908,10 +951,16 @@ class BaseInferenceEngine(ABC):
         set_instruction = getattr(self, "set_instruction", None)
         if callable(set_instruction):
             if not set_instruction(instruction):
-                raise RuntimeError("Failed to set instruction")
+                raise InferenceError(
+                    "Failed to set instruction",
+                    details={"model_type": self.model_type, "instruction": instruction},
+                )
             return
 
-        raise RuntimeError(f"{self.model_type or 'Policy'} does not support language instructions")
+        raise InstructionNotSupportedError(
+            f"{self.model_type or 'Policy'} does not support language instructions",
+            details={"model_type": self.model_type, "instruction": instruction},
+        )
 
     def step(self, observation: Observation) -> np.ndarray:
         """
@@ -920,6 +969,8 @@ class BaseInferenceEngine(ABC):
         This wraps the existing queue-aware `select_action()` behavior and optionally
         updates the language instruction when provided by the caller.
         """
+        self._require_loaded()
+        self._validate_observation(observation)
         self._maybe_apply_instruction(observation.instruction)
         return self.select_action(observation.images, observation.state)
 
@@ -927,9 +978,8 @@ class BaseInferenceEngine(ABC):
         """
         SDK-friendly raw chunk prediction API without queue scheduling.
         """
-        if not self.is_loaded:
-            raise RuntimeError("Model not loaded")
-
+        self._require_loaded()
+        self._validate_observation(observation)
         self._maybe_apply_instruction(observation.instruction)
         return self._predict_chunk(observation.images, observation.state)
     
@@ -1049,6 +1099,19 @@ class BaseInferenceEngine(ABC):
     def unload(self):
         """Unload model and free memory."""
         pass
+
+    def close(self):
+        """Alias for unload() to match common SDK usage patterns."""
+        self.unload()
+
+    def __enter__(self):
+        self._require_loaded()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
     def set_trace_recorder(self, recorder: TraceRecorder):
         """Set trace recorder for observability."""
         self._trace_recorder = recorder
