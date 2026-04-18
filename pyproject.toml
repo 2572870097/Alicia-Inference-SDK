@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alicia-inference-sdk"
+version = "0.1.0"
+description = "Reusable policy inference SDK for ACT, PI0 and SmolVLA models."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "opencv-python",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+act = [
+    "omegaconf",
+    "torch",
+    "safetensors",
+]
+pi0 = [
+    "torch",
+    "transformers",
+    "safetensors",
+]
+smolvla = [
+    "torch",
+    "transformers",
+    "safetensors",
+]
+all = [
+    "omegaconf",
+    "torch",
+    "transformers",
+    "safetensors",
+]
+
+[tool.setuptools]
+packages = ["inference_sdk"]
