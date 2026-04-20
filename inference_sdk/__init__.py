@@ -42,6 +42,7 @@ if sparkmind_root.is_dir():
         sys.path.insert(0, sparkmind_root_str)
 
 from .core.config import DeviceConfig, PolicyLoadConfig, RuntimeConfig, SUPPORTED_MODEL_TYPES
+from .api import InferenceAPI
 from .core.exceptions import (
     CheckpointError,
     ConfigurationError,
@@ -448,6 +449,8 @@ def __getattr__(name: str):
 
 
 __all__ = [
+    # User-facing API
+    "InferenceAPI",
     # Core classes
     "BaseInferenceEngine",
     "ACTInferenceEngine",
