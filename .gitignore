@@ -1,0 +1,4 @@
+models/
+alicia_inference_sdk.egg-info/
+__pycache__/
+*.py[cod]

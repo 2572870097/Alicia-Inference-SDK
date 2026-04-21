@@ -20,6 +20,13 @@ class DeviceConfig:
         normalized = self.device.strip() if isinstance(self.device, str) else ""
         if not normalized:
             raise ConfigurationError("`device` must be a non-empty string")
+        if normalized == "cpu" or normalized == "cuda":
+            return
+        if normalized.startswith("cuda:") and normalized.split(":", 1)[1].isdigit():
+            return
+        raise ConfigurationError(
+            "`device` must be one of: `cpu`, `cuda`, or `cuda:<index>`"
+        )
 
 
 @dataclass(frozen=True)

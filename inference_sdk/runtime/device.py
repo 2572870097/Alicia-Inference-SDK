@@ -44,15 +44,26 @@ def _cuda_device_count() -> int:
         return 0
 
 
-def _mps_available() -> bool:
-    try:
-        return bool(torch.backends.mps.is_available())
-    except Exception:
-        return False
+def _is_supported_device_name(device: str) -> bool:
+    if device == "cpu" or device == "cuda":
+        return True
+    if device.startswith("cuda:") and device.split(":", 1)[1].isdigit():
+        return True
+    return False
 
 
 def resolve_torch_device(requested_device: Optional[str] = None) -> DeviceSelection:
     requested = _normalize_device_name(requested_device)
+
+    if not _is_supported_device_name(requested):
+        message = (
+            f"请求使用不受支持的设备 `{requested}`。"
+            "当前仅支持 `cpu`、`cuda` 或 `cuda:<index>`。"
+        )
+        raise DeviceUnavailableError(message)
+
+    if requested == "cpu":
+        return DeviceSelection(requested=requested, actual=requested)
 
     if requested.startswith("cuda"):
         device_count = _cuda_device_count()
@@ -71,10 +82,6 @@ def resolve_torch_device(requested_device: Optional[str] = None) -> DeviceSelect
             f" torch.cuda.is_available()={torch.cuda.is_available()}，"
             f" torch.cuda.device_count()={device_count}。"
         )
-        raise DeviceUnavailableError(message)
-
-    if requested == "mps" and not _mps_available():
-        message = "请求使用 `mps`，但当前环境 MPS 不可用。"
         raise DeviceUnavailableError(message)
 
     return DeviceSelection(requested=requested, actual=requested)

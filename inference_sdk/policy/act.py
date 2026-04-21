@@ -15,7 +15,6 @@ from typing import Any, Dict, Optional, Tuple
 import cv2
 import numpy as np
 import torch
-import yaml
 
 from ..core.exceptions import ResourceStateError
 from ..runtime.base import BaseInferenceEngine, SmoothingConfig
@@ -29,7 +28,6 @@ except ImportError:
     load_safetensors_file = None
 
 
-LEGACY_CHECKPOINT_FILES = ("inference_config.yaml", "model.pth", "stats.json")
 PRETRAINED_CHECKPOINT_FILES = ("config.json", "model.safetensors")
 PRETRAINED_SUBDIR_NAME = "pretrained_model"
 PREPROCESSOR_CONFIG_FILENAME = "policy_preprocessor.json"
@@ -38,10 +36,6 @@ POSTPROCESSOR_CONFIG_FILENAME = "policy_postprocessor.json"
 
 def _has_required_files(path: Path, filenames: tuple[str, ...]) -> bool:
     return path.is_dir() and all((path / name).is_file() for name in filenames)
-
-
-def _is_legacy_act_checkpoint(path: Path) -> bool:
-    return _has_required_files(path, LEGACY_CHECKPOINT_FILES)
 
 
 def _is_pretrained_act_dir(path: Path) -> bool:
@@ -60,7 +54,7 @@ def _resolve_act_checkpoint_dir(checkpoint_dir: str) -> Path:
         return path
 
     pretrained_dir = path / PRETRAINED_SUBDIR_NAME
-    if _is_pretrained_act_dir(pretrained_dir):
+    if pretrained_dir.is_dir():
         return pretrained_dir
 
     return path
@@ -156,26 +150,19 @@ def _load_pretrained_act_stats(checkpoint_path: Path) -> Dict[str, Dict[str, Any
 
 def _load_act_state_dict(checkpoint_path: Path, device: torch.device) -> Dict[str, torch.Tensor]:
     safetensors_path = checkpoint_path / "model.safetensors"
-    if safetensors_path.is_file():
-        if load_safetensors_file is None:
-            raise RuntimeError("缺少 safetensors 依赖，无法读取 model.safetensors")
+    if load_safetensors_file is None:
+        raise RuntimeError("缺少 safetensors 依赖，无法读取 model.safetensors")
 
-        try:
-            state_dict = load_safetensors_file(str(safetensors_path), device=str(device))
-        except Exception:
-            state_dict = load_safetensors_file(str(safetensors_path), device="cpu")
-        if any(key.startswith("model.") for key in state_dict):
-            state_dict = {
-                key.removeprefix("model."): value
-                for key, value in state_dict.items()
-            }
-        return state_dict
-
-    model_path = checkpoint_path / "model.pth"
     try:
-        return torch.load(model_path, map_location=device, weights_only=True)
-    except TypeError:
-        return torch.load(model_path, map_location=device)
+        state_dict = load_safetensors_file(str(safetensors_path), device=str(device))
+    except Exception:
+        state_dict = load_safetensors_file(str(safetensors_path), device="cpu")
+    if any(key.startswith("model.") for key in state_dict):
+        state_dict = {
+            key.removeprefix("model."): value
+            for key, value in state_dict.items()
+        }
+    return state_dict
 
 # Try to import SparkMind ACT model
 ACT_AVAILABLE = False
@@ -205,8 +192,7 @@ class ACTInferenceEngine(BaseInferenceEngine):
     ):
         super().__init__(smoothing_config)
         self.model_type = "act"
-
-        device_selection = resolve_torch_device(device)
+        device_selection = resolve_torch_device(device) # “PyTorch 设备选择 + 前置校验”，避免模型加载到一半才发现设备不可用
         self.requested_device = device_selection.requested
         self.actual_device = device_selection.actual
         self.device_warning = device_selection.warning
@@ -226,16 +212,15 @@ class ACTInferenceEngine(BaseInferenceEngine):
 
     @staticmethod
     def validate_checkpoint(checkpoint_dir: str) -> Tuple[bool, str]:
-        """Validate that checkpoint directory contains a supported ACT checkpoint format."""
+        """Validate that checkpoint directory contains a supported exported ACT checkpoint."""
         raw_path = Path(checkpoint_dir)
         if not raw_path.exists():
             return False, f"Checkpoint目录不存在: {checkpoint_dir}"
 
         resolved_path = _resolve_act_checkpoint_dir(checkpoint_dir)
-        if _is_legacy_act_checkpoint(resolved_path) or _is_pretrained_act_dir(resolved_path):
+        if _is_pretrained_act_dir(resolved_path):
             return True, ""
 
-        legacy_missing = [name for name in LEGACY_CHECKPOINT_FILES if not (resolved_path / name).is_file()]
         exported_missing = [name for name in PRETRAINED_CHECKPOINT_FILES if not (resolved_path / name).is_file()]
         processor_missing = [
             name
@@ -244,11 +229,9 @@ class ACTInferenceEngine(BaseInferenceEngine):
         ]
         return (
             False,
-            "ACT模型目录格式不受支持。"
-            f" 旧格式需要: {', '.join(LEGACY_CHECKPOINT_FILES)}"
-            f"；导出格式需要: {', '.join(PRETRAINED_CHECKPOINT_FILES)}"
-            f" + 至少一个processor配置({PREPROCESSOR_CONFIG_FILENAME}/{POSTPROCESSOR_CONFIG_FILENAME})"
-            f"。当前缺少 旧格式文件: {', '.join(legacy_missing) or '无'}"
+            "ACT模型目录格式不受支持。当前仅支持导出格式 checkpoint。"
+            f" 导出格式需要: {', '.join(PRETRAINED_CHECKPOINT_FILES)}"
+            f" + 至少一个 processor 配置({PREPROCESSOR_CONFIG_FILENAME}/{POSTPROCESSOR_CONFIG_FILENAME})"
             f"；导出格式文件: {', '.join(exported_missing) or '无'}"
             f"；processor配置: {', '.join(processor_missing) or '无'}",
         )
@@ -266,21 +249,12 @@ class ACTInferenceEngine(BaseInferenceEngine):
         checkpoint_path = _resolve_act_checkpoint_dir(checkpoint_dir)
         
         try:
-            if _is_legacy_act_checkpoint(checkpoint_path):
-                config_path = checkpoint_path / "inference_config.yaml"
-                with open(config_path, "r") as f:
-                    config_dict = yaml.safe_load(f)
+            config_path = checkpoint_path / "config.json"
+            with open(config_path, "r") as f:
+                pretrained_config = json.load(f)
 
-                stats_path = checkpoint_path / "stats.json"
-                with open(stats_path, "r") as f:
-                    self.stats = json.load(f)
-            else:
-                config_path = checkpoint_path / "config.json"
-                with open(config_path, "r") as f:
-                    pretrained_config = json.load(f)
-
-                config_dict = _convert_pretrained_act_config(pretrained_config)
-                self.stats = _load_pretrained_act_stats(checkpoint_path)
+            config_dict = _convert_pretrained_act_config(pretrained_config)
+            self.stats = _load_pretrained_act_stats(checkpoint_path)
 
             self.config = OmegaConf.create(config_dict)
             

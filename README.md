@@ -13,8 +13,8 @@ This repository is the developer-facing inference layer. It standardizes:
 - how async control-loop inference is started and stopped
 - how errors are surfaced to SDK callers
 
-The v1 SDK contract is documented in
-[`docs/v1-sdk-design.md`](docs/v1-sdk-design.md).
+The public SDK surface is documented in this README and in
+[`INFERENCE_API_GUIDE.md`](INFERENCE_API_GUIDE.md).
 
 ## Installation
 
@@ -22,12 +22,6 @@ Install in editable mode from this directory:
 
 ```bash
 pip install -e .
-```
-
-Or from the monorepo root:
-
-```bash
-pip install -e Alicia-Inference-SDK
 ```
 
 Model-specific extras:
@@ -38,6 +32,22 @@ pip install -e .[pi0]
 pip install -e .[smolvla]
 pip install -e .[all]
 ```
+
+Those extras are only the SDK-side dependencies. The actual policy
+implementations import `sparkmind.*`, so the active virtual environment also
+needs SparkMind available in the same environment. A common workspace layout is
+to keep `SparkMind` next to this repository and install that checkout too:
+
+```bash
+source .venv/bin/activate
+pip install -e .[all]
+pip install -e ../SparkMind
+```
+
+If a sibling `SparkMind/` checkout exists, the SDK also tries to add it to
+`sys.path` at runtime as a fallback. That fallback only helps Python find the
+source tree. SparkMind's own Python dependencies still must be installed in the
+same virtual environment.
 
 Base dependencies:
 
@@ -59,6 +69,65 @@ Optional model dependencies:
 - `smolvla`
 
 `PI0` and `SmolVLA` support language instructions. `ACT` does not.
+
+## Runtime Prerequisites
+
+Before calling `load_model(...)`, make sure the runtime assets match the model
+type:
+
+- `act`: requires a valid exported ACT checkpoint directory.
+- `pi0`: requires a valid PI0 checkpoint plus tokenizer assets. The SDK checks
+  `tokenizer_path`, then `PI0_TOKENIZER_PATH`, then common local `models/...`
+  folders before falling back to Hugging Face.
+- `smolvla`: requires a valid SmolVLA checkpoint plus the base VLM assets
+  declared by the checkpoint config. For offline runs, set
+  `SMOLVLA_VLM_MODEL_PATH` to a local copy of that model.
+
+For a local smoke test, this repository currently includes one exported ACT
+checkpoint under [`model/ACT_pick_and_place_v2`](model/ACT_pick_and_place_v2).
+
+### Asset Download Paths
+
+- `ACT checkpoint`:
+  This repository already bundles one exported ACT checkpoint at
+  [`model/ACT_pick_and_place_v2`](model/ACT_pick_and_place_v2). Its model card
+  points to the Hugging Face repo `z18820636149/ACT_pick_and_place_v2`.
+- `PI0 checkpoint`:
+  the SDK does not hardcode a single download repo. Use any exported PI0
+  checkpoint directory that matches the expected format, then pass it through
+  `checkpoint_dir`.
+- `PI0 tokenizer`:
+  the default remote asset is `google/paligemma2-3b-mix-224`.
+- `SmolVLA checkpoint`:
+  the SDK does not hardcode a single download repo. Use any exported SmolVLA
+  checkpoint directory that matches the expected format, then pass it through
+  `checkpoint_dir`.
+- `SmolVLA base VLM`:
+  the default remote asset is `HuggingFaceTB/SmolVLM2-500M-Video-Instruct`.
+
+Recommended local download commands:
+
+```bash
+source .venv/bin/activate
+
+# PI0 tokenizer
+hf download google/paligemma2-3b-mix-224 \
+  --local-dir models/google/paligemma2-3b-mix-224
+export PI0_TOKENIZER_PATH=$PWD/models/google/paligemma2-3b-mix-224
+
+# SmolVLA base VLM
+hf download HuggingFaceTB/SmolVLM2-500M-Video-Instruct \
+  --local-dir models/HuggingFaceTB/SmolVLM2-500M-Video-Instruct
+export SMOLVLA_VLM_MODEL_PATH=$PWD/models/HuggingFaceTB/SmolVLM2-500M-Video-Instruct
+```
+
+Local path resolution used by the SDK:
+
+- `PI0 tokenizer`: `tokenizer_path` -> `PI0_TOKENIZER_PATH` ->
+  `checkpoint_dir/tokenizer` -> local `models/google/paligemma2-3b-mix-224`
+  style directories.
+- `SmolVLA base VLM`: `SMOLVLA_VLM_MODEL_PATH` -> `checkpoint_dir/vlm_model` ->
+  local `models/HuggingFaceTB/SmolVLM2-500M-Video-Instruct` style directories.
 
 ## Public API
 
@@ -94,6 +163,9 @@ Core runtime methods on a loaded session or policy:
 
 This is the recommended v1 usage pattern.
 
+For the shortest local smoke test, use the bundled ACT checkpoint under
+`model/ACT_pick_and_place_v2`.
+
 ```python
 from inference_sdk import (
     DeviceConfig,
@@ -105,15 +177,13 @@ from inference_sdk import (
 )
 
 config = PolicyLoadConfig(
-    checkpoint_dir="/path/to/checkpoint",
-    model_type="pi0",
-    device=DeviceConfig(device="cuda:0"),
+    checkpoint_dir="model/ACT_pick_and_place_v2",
+    model_type="act",
+    device=DeviceConfig(device="cpu"),
     runtime=RuntimeConfig(
         control_fps=20.0,
-        enable_async_inference=True,
+        enable_async_inference=False,
     ),
-    tokenizer_path="/path/to/tokenizer",
-    instruction="pick up the apple",
 )
 
 try:
@@ -130,7 +200,6 @@ try:
                 "wrist": wrist_bgr_frame,
             },
             state=robot_state,
-            instruction="pick up the apple",
         )
 
         action_chunk = session.infer(observation)
@@ -140,6 +209,10 @@ try:
 except SDKError as exc:
     print(exc.code, exc.message, exc.details)
 ```
+
+For `PI0`, pass tokenizer assets through `tokenizer_path` or
+`PI0_TOKENIZER_PATH`. For `SmolVLA`, make sure the base VLM assets are locally
+available or reachable via `SMOLVLA_VLM_MODEL_PATH`.
 
 ### 2. Session-style loading with explicit model parameters
 
@@ -330,15 +403,15 @@ device = DeviceConfig(device="cuda:0")
 
 Behavior:
 
-- the SDK uses the exact requested device string
+- supported values are `cpu`, `cuda`, and `cuda:<index>`
+- unsupported device strings fail validation early
 - if the requested device is unavailable, the SDK raises `DeviceUnavailableError`
 
 ## Model-Specific Notes
 
 ### ACT
 
-- supports legacy checkpoint directories
-- supports exported checkpoint directories
+- supports exported checkpoint directories only
 - does not support language instructions
 
 ### PI0
@@ -354,13 +427,15 @@ Behavior:
 
 ## Examples
 
-Repository examples:
+The repository currently ships one runnable example entrypoint:
 
-- [`examples/act.py`](examples/act.py)
-- [`examples/pi0.py`](examples/pi0.py)
-- [`examples/smolvla.py`](examples/smolvla.py)
+- [`examples/api_usage.py`](examples/api_usage.py)
 
-See [`examples/README.md`](examples/README.md) for runnable commands.
+That script demonstrates:
+
+- ACT loading with the bundled sample checkpoint
+- control-loop style inference
+- PI0 runtime prerequisites such as tokenizer assets
 
 ## Repository Layout
 
@@ -383,7 +458,9 @@ inference_sdk/
     device.py
     monitoring.py
 examples/
-docs/
+model/
+INFERENCE_API_GUIDE.md
+pyproject.toml
 ```
 
 Package responsibilities:
@@ -400,6 +477,7 @@ Package responsibilities:
 - host applications can inject a monitor via `set_inference_monitor(...)`
 - the package is designed to be installed independently via editable install
 
-## Related Design Doc
+## Related Notes
 
-- [`docs/v1-sdk-design.md`](docs/v1-sdk-design.md)
+- [`INFERENCE_API_GUIDE.md`](INFERENCE_API_GUIDE.md)
+- [`examples/api_usage.py`](examples/api_usage.py)

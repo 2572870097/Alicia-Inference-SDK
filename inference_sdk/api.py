@@ -5,14 +5,16 @@ Alicia Inference API - 用户级 API
 """
 import logging
 import time
-from typing import Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 import numpy as np
 
 from .core.config import DeviceConfig, PolicyLoadConfig, RuntimeConfig
 from .core.exceptions import SDKError, ResourceStateError, ValidationError
 from .core.types import Observation, PolicyMetadata, PolicyStatus
-from .runtime.base import InferenceSession
+
+if TYPE_CHECKING:
+    from . import InferenceSession
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +27,7 @@ class InferenceAPI:
 
         :param auto_start_async: 加载模型后自动启动异步推理
         """
-        self._session: Optional[InferenceSession] = None
+        self._session: Optional["InferenceSession"] = None
         self._auto_start_async = auto_start_async
         self._model_loaded = False
 
@@ -71,6 +73,8 @@ class InferenceAPI:
             )
 
             # 加载模型
+            from . import InferenceSession
+
             self._session = InferenceSession()
             self._session.load(config=config)
             self._model_loaded = True

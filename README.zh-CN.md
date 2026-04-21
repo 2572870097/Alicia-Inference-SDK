@@ -12,8 +12,8 @@
 - 异步控制环推理如何启动和停止
 - SDK 如何向调用方暴露错误
 
-v1 SDK 契约说明见
-[`docs/v1-sdk-design.zh-CN.md`](docs/v1-sdk-design.zh-CN.md)。
+公开 SDK 用法主要记录在当前 README 和
+[`INFERENCE_API_GUIDE.md`](INFERENCE_API_GUIDE.md) 中。
 
 ## 安装
 
@@ -21,12 +21,6 @@ v1 SDK 契约说明见
 
 ```bash
 pip install -e .
-```
-
-或者从 monorepo 根目录安装：
-
-```bash
-pip install -e Alicia-Inference-SDK
 ```
 
 按模型安装可选依赖：
@@ -37,6 +31,20 @@ pip install -e .[pi0]
 pip install -e .[smolvla]
 pip install -e .[all]
 ```
+
+这些 extras 只覆盖 SDK 自身依赖，不等于模型已经可以运行。实际的策略实现会导
+入 `sparkmind.*`，所以当前虚拟环境里还需要让 SparkMind 在同一环境中可用。
+一个常见的工作区结构是把 `SparkMind` 放在当前仓库同级目录，并一并安装：
+
+```bash
+source .venv/bin/activate
+pip install -e .[all]
+pip install -e ../SparkMind
+```
+
+如果存在同级的 `SparkMind/` checkout，SDK 也会在运行时尝试把它加入
+`sys.path` 作为兜底路径。但这只解决“源码能被找到”，并不会替你安装
+SparkMind 自己的 Python 依赖，所以这些依赖仍然必须装在同一个虚拟环境里。
 
 基础依赖：
 
@@ -58,6 +66,62 @@ pip install -e .[all]
 - `smolvla`
 
 `PI0` 和 `SmolVLA` 支持语言指令，`ACT` 不支持。
+
+## 运行前提
+
+在调用 `load_model(...)` 之前，请先确认对应模型的运行资产已经就绪：
+
+- `act`：只支持合法的 ACT 导出 checkpoint 目录。
+- `pi0`：需要合法的 PI0 checkpoint，以及 tokenizer 资产。SDK 会依次检查
+  `tokenizer_path`、`PI0_TOKENIZER_PATH`、常见的本地 `models/...` 目录，
+  最后才会尝试从 Hugging Face 加载。
+- `smolvla`：需要合法的 SmolVLA checkpoint，以及 checkpoint 配置里声明的
+  基础 VLM 资产。离线运行时，建议通过 `SMOLVLA_VLM_MODEL_PATH` 指向本地模型。
+
+如果只想做本地 smoke test，这个仓库当前自带一个导出的 ACT checkpoint：
+[`model/ACT_pick_and_place_v2`](model/ACT_pick_and_place_v2)。
+
+### 资产下载路径
+
+- `ACT checkpoint`：
+  当前仓库已经自带一个导出的 ACT checkpoint，路径是
+  [`model/ACT_pick_and_place_v2`](model/ACT_pick_and_place_v2)。这个模型卡里对
+  应的 Hugging Face repo 是 `z18820636149/ACT_pick_and_place_v2`。
+- `PI0 checkpoint`：
+  SDK 没有写死唯一下载仓库。你可以使用任何符合格式要求的导出 PI0 checkpoint
+  目录，然后通过 `checkpoint_dir` 传入。
+- `PI0 tokenizer`：
+  代码里的默认远端资产名是 `google/paligemma2-3b-mix-224`。
+- `SmolVLA checkpoint`：
+  SDK 没有写死唯一下载仓库。你可以使用任何符合格式要求的导出 SmolVLA
+  checkpoint 目录，然后通过 `checkpoint_dir` 传入。
+- `SmolVLA 基础 VLM`：
+  代码里的默认远端资产名是
+  `HuggingFaceTB/SmolVLM2-500M-Video-Instruct`。
+
+推荐的本地下载方式：
+
+```bash
+source .venv/bin/activate
+
+# PI0 tokenizer
+hf download google/paligemma2-3b-mix-224 \
+  --local-dir models/google/paligemma2-3b-mix-224
+export PI0_TOKENIZER_PATH=$PWD/models/google/paligemma2-3b-mix-224
+
+# SmolVLA 基础 VLM
+hf download HuggingFaceTB/SmolVLM2-500M-Video-Instruct \
+  --local-dir models/HuggingFaceTB/SmolVLM2-500M-Video-Instruct
+export SMOLVLA_VLM_MODEL_PATH=$PWD/models/HuggingFaceTB/SmolVLM2-500M-Video-Instruct
+```
+
+SDK 的本地查找顺序：
+
+- `PI0 tokenizer`：`tokenizer_path` -> `PI0_TOKENIZER_PATH` ->
+  `checkpoint_dir/tokenizer` -> 本地 `models/google/paligemma2-3b-mix-224`
+  这类目录。
+- `SmolVLA 基础 VLM`：`SMOLVLA_VLM_MODEL_PATH` -> `checkpoint_dir/vlm_model` ->
+  本地 `models/HuggingFaceTB/SmolVLM2-500M-Video-Instruct` 这类目录。
 
 ## 公共 API
 
@@ -93,6 +157,9 @@ pip install -e .[all]
 
 这是推荐的 v1 用法。
 
+如果只想走最短的本地验证路径，优先使用仓库自带的
+`model/ACT_pick_and_place_v2`。
+
 ```python
 from inference_sdk import (
     DeviceConfig,
@@ -104,15 +171,13 @@ from inference_sdk import (
 )
 
 config = PolicyLoadConfig(
-    checkpoint_dir="/path/to/checkpoint",
-    model_type="pi0",
-    device=DeviceConfig(device="cuda:0"),
+    checkpoint_dir="model/ACT_pick_and_place_v2",
+    model_type="act",
+    device=DeviceConfig(device="cpu"),
     runtime=RuntimeConfig(
         control_fps=20.0,
-        enable_async_inference=True,
+        enable_async_inference=False,
     ),
-    tokenizer_path="/path/to/tokenizer",
-    instruction="pick up the apple",
 )
 
 try:
@@ -129,7 +194,6 @@ try:
                 "wrist": wrist_bgr_frame,
             },
             state=robot_state,
-            instruction="pick up the apple",
         )
 
         action_chunk = session.infer(observation)
@@ -139,6 +203,10 @@ try:
 except SDKError as exc:
     print(exc.code, exc.message, exc.details)
 ```
+
+如果要加载 `PI0`，请通过 `tokenizer_path` 或 `PI0_TOKENIZER_PATH` 提供
+tokenizer 资产；如果要加载 `SmolVLA`，请确保基础 VLM 资产已准备好，或通过
+`SMOLVLA_VLM_MODEL_PATH` 指向本地目录。
 
 ### 2. 直接按模型参数加载 Session
 
@@ -328,15 +396,15 @@ device = DeviceConfig(device="cuda:0")
 
 行为约定：
 
-- SDK 会严格使用你传入的设备字符串
+- 当前仅支持 `cpu`、`cuda` 和 `cuda:<index>`
+- 不受支持的设备字符串会在配置校验阶段直接报错
 - 如果请求的设备不可用，SDK 会直接抛出 `DeviceUnavailableError`
 
 ## 模型专项说明
 
 ### ACT
 
-- 支持旧版 checkpoint 目录格式
-- 支持导出后的 checkpoint 目录格式
+- 只支持导出后的 checkpoint 目录格式
 - 不支持语言指令
 
 ### PI0
@@ -352,13 +420,15 @@ device = DeviceConfig(device="cuda:0")
 
 ## 示例
 
-仓库当前只保留每个算法一个示例入口：
+当前仓库只提供一个可直接运行的示例入口：
 
-- [`examples/act.py`](examples/act.py)
-- [`examples/pi0.py`](examples/pi0.py)
-- [`examples/smolvla.py`](examples/smolvla.py)
+- [`examples/api_usage.py`](examples/api_usage.py)
 
-可运行命令见 [`examples/README.zh-CN.md`](examples/README.zh-CN.md)。
+这个脚本会演示：
+
+- 使用仓库内置的 ACT checkpoint 加载模型
+- 控制环风格的推理调用
+- PI0 运行前还需要 tokenizer 资产这类前置条件
 
 ## 仓库结构
 
@@ -381,7 +451,9 @@ inference_sdk/
     device.py
     monitoring.py
 examples/
-docs/
+model/
+INFERENCE_API_GUIDE.md
+pyproject.toml
 ```
 
 目录职责划分：
@@ -398,6 +470,7 @@ docs/
 - 宿主应用可以通过 `set_inference_monitor(...)` 注入自己的 monitor
 - 这个包设计为可独立 editable install 的推理 SDK
 
-## 相关设计文档
+## 相关说明
 
-- [`docs/v1-sdk-design.zh-CN.md`](docs/v1-sdk-design.zh-CN.md)
+- [`INFERENCE_API_GUIDE.md`](INFERENCE_API_GUIDE.md)
+- [`examples/api_usage.py`](examples/api_usage.py)
