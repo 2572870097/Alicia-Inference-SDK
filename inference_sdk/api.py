@@ -10,11 +10,10 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Union
 import numpy as np
 
 from .core.config import DeviceConfig, PolicyLoadConfig, RuntimeConfig
-from .core.exceptions import SDKError, ResourceStateError, ValidationError
 from .core.types import Observation, PolicyMetadata, PolicyStatus
 
 if TYPE_CHECKING:
-    from . import InferenceSession
+    from .session import InferenceSession
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +41,9 @@ class InferenceAPI:
         instruction: Optional[str] = None,
         control_fps: float = 20.0,
         enable_async: bool = True,
+        temporal_ensemble_coeff: Optional[float] = None,
+        robot_type: Optional[str] = None,
+        policy_robot_type: Optional[str] = None,
     ) -> Dict:
         """加载推理模型
 
@@ -52,6 +54,9 @@ class InferenceAPI:
         :param instruction: 语言指令 (PI0/SmolVLA)
         :param control_fps: 控制频率
         :param enable_async: 是否启用异步推理
+        :param temporal_ensemble_coeff: 通用时间集成系数。设置后每一步都会重新推理并对重叠动作做指数加权融合
+        :param robot_type: 运行时机械臂类型 (ACT 可选, 如 Alicia-D / Alicia-M)
+        :param policy_robot_type: 模型动作空间对应的机械臂类型 (ACT 可选)
         :return: 包含模型元数据的字典
         """
         try:
@@ -67,13 +72,16 @@ class InferenceAPI:
                 runtime=RuntimeConfig(
                     control_fps=control_fps,
                     enable_async_inference=enable_async,
+                    temporal_ensemble_coeff=temporal_ensemble_coeff,
                 ),
                 tokenizer_path=tokenizer_path,
                 instruction=instruction,
+                robot_type=robot_type,
+                policy_robot_type=policy_robot_type,
             )
 
             # 加载模型
-            from . import InferenceSession
+            from .session import InferenceSession
 
             self._session = InferenceSession()
             self._session.load(config=config)
@@ -96,9 +104,6 @@ class InferenceAPI:
                 "chunk_size": metadata.chunk_size,
             }
 
-        except SDKError as e:
-            logger.error(f"加载模型失败: {e.message}")
-            raise
         except Exception as e:
             logger.error(f"加载模型时发生未知错误: {str(e)}")
             raise
@@ -135,7 +140,7 @@ class InferenceAPI:
         :return: 动作向量 (numpy array)
         """
         if not self.is_loaded():
-            raise ResourceStateError("模型未加载，请先调用 load_model()")
+            raise RuntimeError("模型未加载，请先调用 load_model()")
 
         try:
             # 确保 state 是 numpy 数组
@@ -153,9 +158,6 @@ class InferenceAPI:
             action = self._session.infer(observation)
             return action
 
-        except SDKError as e:
-            logger.error(f"推理失败: {e.message}")
-            raise
         except Exception as e:
             logger.error(f"推理时发生未知错误: {str(e)}")
             raise
@@ -174,7 +176,7 @@ class InferenceAPI:
         :return: 单步动作向量
         """
         if not self.is_loaded():
-            raise ResourceStateError("模型未加载，请先调用 load_model()")
+            raise RuntimeError("模型未加载，请先调用 load_model()")
 
         try:
             if isinstance(state, list):
@@ -189,9 +191,6 @@ class InferenceAPI:
             action = self._session.step(observation)
             return action
 
-        except SDKError as e:
-            logger.error(f"单步推理失败: {e.message}")
-            raise
         except Exception as e:
             logger.error(f"单步推理时发生未知错误: {str(e)}")
             raise
@@ -201,13 +200,13 @@ class InferenceAPI:
     def get_metadata(self) -> PolicyMetadata:
         """获取模型元数据"""
         if not self.is_loaded():
-            raise ResourceStateError("模型未加载")
+            raise RuntimeError("模型未加载")
         return self._session.get_metadata()
 
     def get_status(self) -> PolicyStatus:
         """获取模型运行状态"""
         if not self.is_loaded():
-            raise ResourceStateError("模型未加载")
+            raise RuntimeError("模型未加载")
         return self._session.get_status()
 
     def get_model_info(self) -> Dict:
@@ -237,14 +236,14 @@ class InferenceAPI:
     def start_async_inference(self):
         """启动异步推理"""
         if not self.is_loaded():
-            raise ResourceStateError("模型未加载")
+            raise RuntimeError("模型未加载")
         self._session.start_async_inference()
         logger.info("异步推理已启动")
 
     def stop_async_inference(self):
         """停止异步推理"""
         if not self.is_loaded():
-            raise ResourceStateError("模型未加载")
+            raise RuntimeError("模型未加载")
         self._session.stop_async_inference()
         logger.info("异步推理已停止")
 

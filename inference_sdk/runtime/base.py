@@ -4,99 +4,26 @@ Base Inference Engine with LeRobot-style Async Inference.
 Key Features (LeRobot Pattern):
 - Timestamp-aligned action queue (not FIFO)
 - Time-based action selection (skip expired actions)
-- Adaptive chunk threshold based on latency estimation
+- Queue refill based on chunk threshold
 - Observation queue maxsize=1 (always use latest frame)
-- Aggregate function for overlapping action chunks
 """
 
 import logging
+import math
 import threading
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from queue import Queue, Empty, Full
 from typing import Callable, Dict, List, Optional, Tuple, Any
 
 import numpy as np
 
-from ..core.exceptions import (
-    InferenceError,
-    InstructionNotSupportedError,
-    ResourceStateError,
-    ValidationError,
-)
 from ..core.types import Observation, PolicyMetadata, PolicyStatus
 from .monitoring import get_inference_monitor
 
 logger = logging.getLogger(__name__)
-
-@dataclass
-class TraceEvent:
-    timestamp: float
-    source: str
-    event: str
-    details: Dict[str, Any] = field(default_factory=dict)
-
-class TraceRecorder:
-    """
-    Simple recorder for tracing async inference events.
-
-    Memory-safe: Limits event history to prevent unbounded growth
-    during long-running inference sessions.
-    """
-    def __init__(self, max_events: int = 1000):
-        """
-        Args:
-            max_events: Maximum number of events to keep (default: 1000)
-                       Older events are automatically discarded.
-        """
-        self.events: List[TraceEvent] = []
-        self._start_time = time.time()
-        self._lock = threading.Lock()
-        self._max_events = max_events
-
-    def record(self, source: str, event: str, **details):
-        with self._lock:
-            self.events.append(TraceEvent(
-                timestamp=time.time() - self._start_time,
-                source=source,
-                event=event,
-                details=details
-            ))
-
-            # Limit event history to prevent memory leak
-            if len(self.events) > self._max_events:
-                # Remove oldest 10% when limit exceeded
-                remove_count = self._max_events // 10
-                self.events = self.events[remove_count:]
-
-    def clear(self):
-        with self._lock:
-            self.events = []
-            self._start_time = time.time()
-
-# ==================== Gripper Smoothing ====================
-# ==================== Aggregate Functions ====================
-# Following LeRobot pattern: configs.py
-
-AGGREGATE_FUNCTIONS = {
-    "latest_only": lambda old, new: new,
-    "weighted_average": lambda old, new: 0.3 * old + 0.7 * new,
-    "average": lambda old, new: 0.5 * old + 0.5 * new,
-    "conservative": lambda old, new: 0.7 * old + 0.3 * new,
-}
-
-
-def get_aggregate_function(name: str) -> Callable[[np.ndarray, np.ndarray], np.ndarray]:
-    """Get aggregate function by name from registry."""
-    if name not in AGGREGATE_FUNCTIONS:
-        available = list(AGGREGATE_FUNCTIONS.keys())
-        raise ValueError(f"Unknown aggregate function '{name}'. Available: {available}")
-    return AGGREGATE_FUNCTIONS[name]
-
-
-# ==================== Data Structures (LeRobot Pattern) ====================
 
 @dataclass
 class TimedAction:
@@ -117,7 +44,7 @@ class TimedAction:
 
 @dataclass  
 class TimedObservation:
-    """Observation with timestamp for latency tracking."""
+    """Observation with timestamp for control-loop scheduling."""
     timestamp: float  # When observation was captured
     timestep: int     # Sequential step index
     images: Dict[str, np.ndarray]
@@ -133,27 +60,20 @@ class TimedObservation:
 
 @dataclass
 class SmoothingConfig:
-    """Configuration for async inference and action smoothing."""
+    """Configuration for async inference runtime behavior."""
     # Control frequency
     control_fps: float = 30.0
-    
-    # Gripper velocity clamping (in raw action space, [0, 1000])
-    gripper_max_velocity: float = 200.0
-    enable_gripper_clamping: bool = True
-    
+
     # Async inference settings
-    enable_async_inference: bool = True
+    enable_async_inference: bool = False
     
     # Chunk threshold: trigger new inference when queue_size / chunk_size <= threshold
-    # This is adaptive based on latency
     chunk_size_threshold: float = 0.5
-    
-    # Latency estimation
-    latency_ema_alpha: float = 0.2  # EMA smoothing factor
-    latency_safety_margin: float = 1.5  # Multiply latency estimate by this for safety
-    
-    # Aggregate function for overlapping chunks
-    aggregate_fn_name: str = "latest_only"  # "latest_only", "weighted_average", etc.
+
+    # Generic temporal ensembling coefficient. When set, `step()` performs
+    # inference on every control step and exponentially blends overlapping
+    # future actions, following the ACT temporal ensembling pattern.
+    temporal_ensemble_coeff: Optional[float] = None
     
     # Observation queue settings (LeRobot uses maxsize=1)
     obs_queue_maxsize: int = 1
@@ -161,45 +81,108 @@ class SmoothingConfig:
     # Fallback when queue empty
     fallback_mode: str = "repeat"  # "repeat", "hold"
     
-    # Legacy compatibility flags (not used in new implementation)
-    fully_async: bool = False  # Ignored, always use async if enable_async_inference=True
-    enable_async_prefetch: bool = True  # Mapped to enable_async_inference
-    
     @property
     def environment_dt(self) -> float:
         """Time step in seconds."""
         return 1.0 / self.control_fps
 
+    @property
+    def temporal_ensemble_enabled(self) -> bool:
+        return self.temporal_ensemble_coeff is not None
 
-# ==================== Latency Estimator ====================
+class TemporalEnsembler:
+    """
+    Runtime-level temporal ensembling for action chunks.
 
-class LatencyEstimator:
-    """Estimates inference latency using exponential moving average."""
-    
-    def __init__(self, alpha: float = 0.2, initial_value: float = 0.1):
-        self.alpha = alpha
-        self.value = initial_value
-        self._initialized = False
-        self._lock = threading.Lock()
-    
-    def update(self, latency: float):
-        """Update estimate with new measurement."""
-        with self._lock:
-            if not self._initialized:
-                self.value = latency
-                self._initialized = True
-            else:
-                self.value = self.alpha * latency + (1 - self.alpha) * self.value
-    
-    def get_value(self) -> float:
-        """Get current estimate."""
-        with self._lock:
-            return self.value
-    
-    def get_steps_during_inference(self, fps: float) -> int:
-        """Calculate how many control steps will pass during one inference."""
-        with self._lock:
-            return int(np.ceil(self.value * fps))
+    This mirrors the ACT temporal ensembling idea, but works on any policy
+    that emits a sequence of future actions from `_predict_chunk(...)`.
+    """
+
+    def __init__(self, temporal_ensemble_coeff: float):
+        if not math.isfinite(temporal_ensemble_coeff):
+            raise ValueError("`temporal_ensemble_coeff` must be finite")
+        self.temporal_ensemble_coeff = float(temporal_ensemble_coeff)
+        self._ensemble_weights: Optional[np.ndarray] = None
+        self._ensemble_weights_cumsum: Optional[np.ndarray] = None
+        self._weights_capacity: int = 0
+        self.reset()
+
+    def reset(self):
+        self.ensembled_actions: Optional[np.ndarray] = None
+        self.ensembled_actions_count: Optional[np.ndarray] = None
+
+    def _ensure_weights(self, size: int):
+        if size <= self._weights_capacity:
+            return
+
+        indices = np.arange(size, dtype=np.float32)
+        self._ensemble_weights = np.exp(-self.temporal_ensemble_coeff * indices).astype(np.float32)
+        self._ensemble_weights_cumsum = np.cumsum(self._ensemble_weights, axis=0)
+        self._weights_capacity = size
+
+    def update(self, actions: np.ndarray) -> np.ndarray:
+        """
+        Update the rolling ensemble and return the next action to execute.
+
+        Args:
+            actions: Array with shape (horizon, action_dim) or (action_dim,)
+        """
+        actions_array = np.asarray(actions, dtype=np.float32)
+        if actions_array.ndim == 1:
+            actions_array = actions_array[None, :]
+        if actions_array.ndim != 2:
+            raise ValueError(
+                f"`actions` must have shape (horizon, action_dim), got {actions_array.shape}"
+            )
+        if actions_array.shape[0] == 0:
+            raise ValueError("`actions` must contain at least one step")
+
+        if self.ensembled_actions is None:
+            self._ensure_weights(actions_array.shape[0])
+            self.ensembled_actions = actions_array.copy()
+            self.ensembled_actions_count = np.ones(actions_array.shape[0], dtype=np.int64)
+        else:
+            assert self.ensembled_actions_count is not None
+            overlap = min(self.ensembled_actions.shape[0], actions_array.shape[0])
+            max_required_weight = max(
+                actions_array.shape[0],
+                int(self.ensembled_actions_count[:overlap].max(initial=0)) + 1 if overlap > 0 else 1,
+            )
+            self._ensure_weights(max_required_weight)
+            assert self._ensemble_weights is not None
+            assert self._ensemble_weights_cumsum is not None
+
+            if overlap > 0:
+                overlap_counts = self.ensembled_actions_count[:overlap]
+                old_weight_sum = self._ensemble_weights_cumsum[overlap_counts - 1]
+                new_weight = self._ensemble_weights[overlap_counts]
+                new_weight_sum = self._ensemble_weights_cumsum[overlap_counts]
+
+                self.ensembled_actions[:overlap] = (
+                    self.ensembled_actions[:overlap] * old_weight_sum[:, None]
+                    + actions_array[:overlap] * new_weight[:, None]
+                ) / new_weight_sum[:, None]
+                self.ensembled_actions_count[:overlap] = overlap_counts + 1
+
+            if actions_array.shape[0] > overlap:
+                self.ensembled_actions = np.concatenate(
+                    [self.ensembled_actions, actions_array[overlap:]],
+                    axis=0,
+                )
+                self.ensembled_actions_count = np.concatenate(
+                    [
+                        self.ensembled_actions_count,
+                        np.ones(actions_array.shape[0] - overlap, dtype=np.int64),
+                    ],
+                    axis=0,
+                )
+
+        assert self.ensembled_actions is not None
+        assert self.ensembled_actions_count is not None
+        action = self.ensembled_actions[0].copy()
+        self.ensembled_actions = self.ensembled_actions[1:]
+        self.ensembled_actions_count = self.ensembled_actions_count[1:]
+        return action
 
 
 # ==================== Action Queue Manager (LeRobot Pattern) ====================
@@ -210,7 +193,7 @@ class TimestampedActionQueue:
 
     Key differences from simple deque:
     1. Actions are indexed by timestep, not FIFO order
-    2. Supports aggregation when new chunk overlaps with existing actions
+    2. Newer chunk predictions overwrite overlapping queued actions
     3. Time-based action retrieval (skip expired actions)
     4. Thread-safe operations
 
@@ -225,7 +208,6 @@ class TimestampedActionQueue:
         self._lock = threading.Lock()
         self._latest_executed_timestep: int = -1
         self._chunk_size: int = 1
-        self._aggregate_fn = get_aggregate_function(config.aggregate_fn_name)
     
     def reset(self):
         """Reset queue state for new episode."""
@@ -248,34 +230,19 @@ class TimestampedActionQueue:
         with self._lock:
             return len(self._queue) / max(1, self._chunk_size)
     
-    def should_request_new_chunk(self, latency_estimator: LatencyEstimator) -> bool:
+    def should_request_new_chunk(self) -> bool:
         """
         Determine if we should trigger new inference.
-        
-        LeRobot pattern: trigger when queue_size / chunk_size <= threshold
-        BUT also consider: we need enough actions to cover inference latency
         """
-        with self._lock:
-            queue_size = len(self._queue)
-        
-        # Basic threshold check
-        fill_ratio = queue_size / max(1, self._chunk_size)
-        if fill_ratio > self.config.chunk_size_threshold:
-            return False
-        
-        # Latency-aware check: do we have enough actions to survive inference?
-        steps_during_inference = latency_estimator.get_steps_during_inference(self.config.control_fps)
-        safety_steps = int(steps_during_inference * self.config.latency_safety_margin)
-        
-        return queue_size <= safety_steps
+        return self.get_fill_ratio() <= self.config.chunk_size_threshold
     
     def add_action_chunk(self, timed_actions: List[TimedAction]):
         """
-        Add new action chunk with aggregation for overlapping timesteps.
+        Add new action chunk, replacing overlapping future timesteps.
 
         LeRobot pattern (from robot_client.py _aggregate_action_queues):
         - Skip actions older than latest executed
-        - Aggregate overlapping timesteps
+        - Replace overlapping timesteps with the latest prediction
         - Add new timesteps directly
         """
         import bisect
@@ -290,14 +257,7 @@ class TimestampedActionQueue:
 
                 # Check if this timestep already exists
                 if timestep in self._queue:
-                    # Aggregate with existing action (timestep already in sorted list)
-                    old_action = self._queue[timestep].get_action()
-                    aggregated = self._aggregate_fn(old_action, new_action.get_action())
-                    self._queue[timestep] = TimedAction(
-                        timestamp=new_action.get_timestamp(),
-                        timestep=timestep,
-                        action=aggregated
-                    )
+                    self._queue[timestep] = new_action
                 else:
                     # Add new action directly and maintain sorted timesteps
                     self._queue[timestep] = new_action
@@ -461,48 +421,6 @@ class ObservationQueue:
                 except Empty:
                     break
 
-
-# ==================== Gripper Smoother ====================
-
-class GripperSmoother:
-    """Velocity clamping for gripper to prevent jerky movements."""
-    
-    def __init__(self, config: SmoothingConfig, action_dim: int = 7):
-        self.config = config
-        self.action_dim = action_dim
-        self._last_action: Optional[np.ndarray] = None
-    
-    def reset(self):
-        """Reset state for new episode."""
-        self._last_action = None
-    
-    def smooth(self, action: np.ndarray) -> np.ndarray:
-        """Apply velocity clamping to gripper."""
-        if not self.config.enable_gripper_clamping or self._last_action is None:
-            self._last_action = action.copy()
-            return action
-        
-        result = action.copy()
-        
-        # Clamp gripper (last dimension)
-        if len(action) >= 7:
-            gripper_idx = -1
-            delta = action[gripper_idx] - self._last_action[gripper_idx]
-            clamped_delta = np.clip(
-                delta, 
-                -self.config.gripper_max_velocity,
-                self.config.gripper_max_velocity
-            )
-            result[gripper_idx] = self._last_action[gripper_idx] + clamped_delta
-        
-        self._last_action = result.copy()
-        return result
-    
-    def get_last_action(self) -> Optional[np.ndarray]:
-        """Get last action (for fallback)."""
-        return self._last_action.copy() if self._last_action is not None else None
-
-
 # ==================== Async Inference Engine ====================
 
 class AsyncInferenceWorker:
@@ -520,14 +438,10 @@ class AsyncInferenceWorker:
         config: SmoothingConfig,
         inference_fn: Callable[[Dict[str, np.ndarray], np.ndarray], np.ndarray],
         action_queue: TimestampedActionQueue,
-        latency_estimator: LatencyEstimator,
-        trace_recorder: Optional[TraceRecorder] = None,
     ):
         self.config = config
         self._inference_fn = inference_fn
         self._action_queue = action_queue
-        self._latency_estimator = latency_estimator
-        self._trace_recorder = trace_recorder
         
         self._obs_queue = ObservationQueue(maxsize=config.obs_queue_maxsize)
         self._thread: Optional[threading.Thread] = None
@@ -583,8 +497,6 @@ class AsyncInferenceWorker:
         if self._must_go_event.is_set() and self._action_queue.get_queue_size() == 0:
             obs.must_go = True
             self._must_go_event.clear()
-            if self._trace_recorder:
-                self._trace_recorder.record("Worker", "MustGo Triggered", timestep=obs.get_timestep())
         
         self._obs_queue.put(obs)
     
@@ -607,24 +519,12 @@ class AsyncInferenceWorker:
                 
                 if not should_process:
                     logger.debug(f"Skipping observation timestep {obs.get_timestep()}")
-                    if self._trace_recorder:
-                        self._trace_recorder.record("Worker", "Skipped Obs", 
-                                                  timestep=obs.get_timestep(),
-                                                  reason="Queue full / Latency check")
                     continue
-                
-                if self._trace_recorder:
-                    self._trace_recorder.record("Worker", "Start Inference", 
-                                              timestep=obs.get_timestep(),
-                                              queue_size=self._action_queue.get_queue_size())
                 
                 # Run inference
                 start_time = time.perf_counter()
                 action_chunk = self._inference_fn(obs.images, obs.state)
                 elapsed = time.perf_counter() - start_time
-                
-                # Update latency estimate
-                self._latency_estimator.update(elapsed)
                 
                 # Convert to TimedActions
                 timed_actions = self._time_action_chunk(
@@ -643,12 +543,6 @@ class AsyncInferenceWorker:
                     f"queue_size={self._action_queue.get_queue_size()}"
                 )
                 
-                if self._trace_recorder:
-                    self._trace_recorder.record("Worker", "End Inference", 
-                                              duration_ms=elapsed*1000,
-                                              chunk_size=len(action_chunk),
-                                              new_queue_size=self._action_queue.get_queue_size())
-                
             except Exception as e:
                 logger.error(f"Async inference error: {e}")
                 import traceback
@@ -666,7 +560,7 @@ class AsyncInferenceWorker:
             return True
         
         # Check if action queue needs refilling
-        return self._action_queue.should_request_new_chunk(self._latency_estimator)
+        return self._action_queue.should_request_new_chunk()
     
     def _time_action_chunk(
         self,
@@ -700,8 +594,7 @@ class BaseInferenceEngine(ABC):
     Key Features:
     - Timestamp-aligned action queue
     - Background inference thread
-    - Latency-adaptive chunk threshold
-    - Gripper velocity clamping
+    - Chunk-threshold based refill
     """
     
     def __init__(self, smoothing_config: Optional[SmoothingConfig] = None):
@@ -721,10 +614,9 @@ class BaseInferenceEngine(ABC):
         
         # Components (initialized after model load)
         self._action_queue: Optional[TimestampedActionQueue] = None
-        self._latency_estimator: Optional[LatencyEstimator] = None
-        self._gripper_smoother: Optional[GripperSmoother] = None
         self._async_worker: Optional[AsyncInferenceWorker] = None
-        self._trace_recorder: Optional[TraceRecorder] = None
+        self._temporal_ensembler: Optional[TemporalEnsembler] = None
+        self._last_action: Optional[np.ndarray] = None
         
         # Episode state
         self._episode_start_time: float = 0.0
@@ -733,6 +625,13 @@ class BaseInferenceEngine(ABC):
     
     def _init_components(self):
         """Initialize all components after model is loaded."""
+        if self.smoothing_config.temporal_ensemble_enabled and self.smoothing_config.enable_async_inference:
+            logger.warning(
+                "%s temporal ensembling requires per-step inference; disabling async inference.",
+                self.model_type or "Inference",
+            )
+            self.smoothing_config.enable_async_inference = False
+
         if self.smoothing_config.enable_async_inference and self.n_action_steps <= 1:
             logger.warning(
                 "%s model reports n_action_steps=%s; disabling async inference because a single-step policy "
@@ -744,65 +643,63 @@ class BaseInferenceEngine(ABC):
 
         self._action_queue = TimestampedActionQueue(self.smoothing_config)
         self._action_queue.set_chunk_size(self.n_action_steps)
-        
-        self._latency_estimator = LatencyEstimator(
-            alpha=self.smoothing_config.latency_ema_alpha,
-            initial_value=0.1
-        )
-        
-        self._gripper_smoother = GripperSmoother(
-            self.smoothing_config,
-            self.action_dim
-        )
-        
+
+        self._temporal_ensembler = None
+        if self.smoothing_config.temporal_ensemble_enabled:
+            assert self.smoothing_config.temporal_ensemble_coeff is not None
+            self._temporal_ensembler = TemporalEnsembler(self.smoothing_config.temporal_ensemble_coeff)
+
         if self.smoothing_config.enable_async_inference:
             self._async_worker = AsyncInferenceWorker(
                 config=self.smoothing_config,
                 inference_fn=self._predict_chunk,
                 action_queue=self._action_queue,
-                latency_estimator=self._latency_estimator,
-                trace_recorder=self._trace_recorder,
             )
 
     def _require_loaded(self):
         if not self.is_loaded:
-            raise ResourceStateError("Policy is not loaded")
+            raise RuntimeError("Policy is not loaded")
 
     def _require_runtime_ready(self):
-        if self._action_queue is None or self._latency_estimator is None:
-            raise ResourceStateError(
+        if self._action_queue is None:
+            raise RuntimeError(
                 "Policy runtime is not initialized. Load the policy before running inference."
             )
 
     def _validate_images_state(self, images: Dict[str, np.ndarray], state: np.ndarray):
         if not isinstance(images, dict):
-            raise ValidationError("`images` must be a dict of camera_role -> numpy.ndarray")
+            raise ValueError("`images` must be a dict of camera_role -> numpy.ndarray")
         if not images:
-            raise ValidationError("`images` cannot be empty")
+            raise ValueError("`images` cannot be empty")
 
         for camera_role, image in images.items():
             if not isinstance(camera_role, str) or not camera_role.strip():
-                raise ValidationError("Image keys must be non-empty strings")
+                raise ValueError("Image keys must be non-empty strings")
             if not isinstance(image, np.ndarray):
-                raise ValidationError(f"Image `{camera_role}` must be a numpy.ndarray")
+                raise ValueError(f"Image `{camera_role}` must be a numpy.ndarray")
             if image.ndim != 3 or image.shape[2] != 3:
-                raise ValidationError(
+                raise ValueError(
                     f"Image `{camera_role}` must have shape (H, W, 3), got {tuple(image.shape)}"
                 )
 
         if not isinstance(state, np.ndarray):
-            raise ValidationError("`state` must be a numpy.ndarray")
+            raise ValueError("`state` must be a numpy.ndarray")
         if state.ndim != 1:
-            raise ValidationError(f"`state` must be a 1D numpy.ndarray, got ndim={state.ndim}")
+            raise ValueError(f"`state` must be a 1D numpy.ndarray, got ndim={state.ndim}")
 
     def _validate_observation(self, observation: Observation):
         if not isinstance(observation, Observation):
-            raise ValidationError("`observation` must be an inference_sdk.Observation instance")
+            raise ValueError("`observation` must be an inference_sdk.Observation instance")
         self._validate_images_state(observation.images, observation.state)
     
     @abstractmethod
     def load(self, checkpoint_dir: str) -> Tuple[bool, str]:
         """Load model from checkpoint directory."""
+        pass
+
+    @abstractmethod
+    def build_inference_frame(self, images: Dict[str, np.ndarray], state: np.ndarray) -> Dict[str, Any]:
+        """Build the model input frame from raw SDK observations."""
         pass
     
     @abstractmethod
@@ -828,13 +725,14 @@ class BaseInferenceEngine(ABC):
         # Reset all components
         if self._action_queue is not None:
             self._action_queue.reset()
-        if self._gripper_smoother is not None:
-            self._gripper_smoother.reset()
+        if self._temporal_ensembler is not None:
+            self._temporal_ensembler.reset()
         
         # Reset episode state
         self._episode_start_time = time.time()
         self._current_timestep = 0
         self._fallback_count = 0
+        self._last_action = None
         
         logger.debug(f"{self.model_type} inference engine reset")
     
@@ -847,6 +745,13 @@ class BaseInferenceEngine(ABC):
         """Stop background inference thread."""
         if self._async_worker is not None:
             self._async_worker.stop()
+
+    def _reset_runtime_buffers(self):
+        """Clear pending scheduling state without resetting episode timing."""
+        if self._action_queue is not None:
+            self._action_queue.reset()
+        if self._temporal_ensembler is not None:
+            self._temporal_ensembler.reset()
     
     def select_action(self, images: Dict[str, np.ndarray], state: np.ndarray) -> np.ndarray:
         """
@@ -855,7 +760,7 @@ class BaseInferenceEngine(ABC):
         Flow:
         1. Create TimedObservation and submit to async worker
         2. Get action from queue (timestamp-aligned or fallback)
-        3. Apply gripper smoothing
+        3. Cache last action for fallback
         4. Increment timestep
         """
         self._require_loaded()
@@ -869,6 +774,18 @@ class BaseInferenceEngine(ABC):
         elapsed = max(0.0, current_time - self._episode_start_time)
         self._current_timestep = int(elapsed / self.smoothing_config.environment_dt)
         
+        # Generic temporal ensembling: run inference every step and blend
+        # overlapping future actions online. This intentionally bypasses the
+        # action queue because queue caching would defeat per-step re-planning.
+        if self._temporal_ensembler is not None:
+            start_time = time.perf_counter()
+            action_chunk = self._predict_chunk(images, state)
+            elapsed = time.perf_counter() - start_time
+            action = self._temporal_ensembler.update(action_chunk)
+            self._last_action = action.copy()
+            logger.debug(f"Temporal ensemble inference: {elapsed*1000:.1f}ms")
+            return action
+
         # Create timed observation
         obs = TimedObservation(
             timestamp=current_time,
@@ -887,9 +804,6 @@ class BaseInferenceEngine(ABC):
                 current_time, 
                 self._episode_start_time
             )
-            
-            if timed_action is None and self._trace_recorder:
-                self._trace_recorder.record("Engine", "Queue Empty", timestep=self._current_timestep)
         else:
             # Synchronous mode: run inference directly if queue empty
             timed_action = self._action_queue.get_next_action()
@@ -899,9 +813,7 @@ class BaseInferenceEngine(ABC):
                 start_time = time.perf_counter()
                 action_chunk = self._predict_chunk(images, state)
                 elapsed = time.perf_counter() - start_time
-                
-                self._latency_estimator.update(elapsed)
-                
+
                 # Add to queue
                 timed_actions = [
                     TimedAction(
@@ -925,10 +837,7 @@ class BaseInferenceEngine(ABC):
             logger.debug(f"Using fallback action (count={self._fallback_count})")
         else:
             action = timed_action.get_action()
-        
-        # Apply gripper smoothing
-        if self._gripper_smoother is not None:
-            action = self._gripper_smoother.smooth(action)
+        self._last_action = action.copy()
         
         # Timestep is updated at start of method based on wall clock
         # self._current_timestep += 1
@@ -951,15 +860,12 @@ class BaseInferenceEngine(ABC):
         set_instruction = getattr(self, "set_instruction", None)
         if callable(set_instruction):
             if not set_instruction(instruction):
-                raise InferenceError(
-                    "Failed to set instruction",
-                    details={"model_type": self.model_type, "instruction": instruction},
-                )
+                raise RuntimeError(f"Failed to set instruction: {instruction}")
+            self._reset_runtime_buffers()
             return
 
-        raise InstructionNotSupportedError(
-            f"{self.model_type or 'Policy'} does not support language instructions",
-            details={"model_type": self.model_type, "instruction": instruction},
+        raise RuntimeError(
+            f"{self.model_type or 'Policy'} does not support language instructions"
         )
 
     def step(self, observation: Observation) -> np.ndarray:
@@ -987,10 +893,8 @@ class BaseInferenceEngine(ABC):
         """Get fallback action when queue is empty."""
         mode = self.smoothing_config.fallback_mode
         
-        if mode == "repeat" and self._gripper_smoother is not None:
-            last_action = self._gripper_smoother.get_last_action()
-            if last_action is not None:
-                return last_action
+        if mode == "repeat" and self._last_action is not None:
+            return self._last_action.copy()
         
         # "hold" mode or no last action: return current state
         return state[:self.action_dim].copy() if len(state) >= self.action_dim else np.zeros(self.action_dim)
@@ -1006,12 +910,6 @@ class BaseInferenceEngine(ABC):
     def get_fallback_count(self) -> int:
         """Get count of fallback uses."""
         return self._fallback_count
-    
-    def get_latency_estimate(self) -> float:
-        """Get current latency estimate in seconds."""
-        if self._latency_estimator is not None:
-            return self._latency_estimator.get_value()
-        return 0.0
     
     def get_required_cameras(self) -> List[str]:
         """Return list of required camera roles."""
@@ -1045,6 +943,15 @@ class BaseInferenceEngine(ABC):
                     getattr(self, "smoothing_config", None)
                     and self.smoothing_config.enable_async_inference
                 ),
+                "temporal_ensemble_enabled": bool(
+                    getattr(self, "smoothing_config", None)
+                    and self.smoothing_config.temporal_ensemble_enabled
+                ),
+                "temporal_ensemble_coeff": (
+                    self.smoothing_config.temporal_ensemble_coeff
+                    if getattr(self, "smoothing_config", None) is not None
+                    else None
+                ),
             },
         )
 
@@ -1054,7 +961,6 @@ class BaseInferenceEngine(ABC):
             is_loaded=bool(self.is_loaded),
             model_type=self.model_type,
             queue_size=self.get_queue_size(),
-            latency_estimate_ms=self.get_latency_estimate() * 1000.0,
             fallback_count=self.get_fallback_count(),
             required_cameras=list(self.get_required_cameras()),
             requested_device=self.requested_device,
@@ -1063,6 +969,10 @@ class BaseInferenceEngine(ABC):
             async_inference_enabled=bool(
                 getattr(self, "smoothing_config", None)
                 and self.smoothing_config.enable_async_inference
+            ),
+            temporal_ensemble_enabled=bool(
+                getattr(self, "smoothing_config", None)
+                and self.smoothing_config.temporal_ensemble_enabled
             ),
         )
     
@@ -1111,9 +1021,3 @@ class BaseInferenceEngine(ABC):
     def __exit__(self, exc_type, exc, tb):
         self.close()
         return False
-
-    def set_trace_recorder(self, recorder: TraceRecorder):
-        """Set trace recorder for observability."""
-        self._trace_recorder = recorder
-        if self._async_worker is not None:
-            self._async_worker._trace_recorder = recorder

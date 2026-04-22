@@ -85,7 +85,8 @@ api = InferenceAPI()
 api.load_model(
     model_type="act",
     checkpoint_dir="/path/to/checkpoint",
-    device="cuda:0"
+    device="cuda:0",
+    temporal_ensemble_coeff=0.01
 )
 
 # 3. 准备数据
@@ -132,7 +133,8 @@ result = api.load_model(
     tokenizer_path=None,           # PI0 tokenizer 路径
     instruction=None,              # 语言指令 (PI0/SmolVLA)
     control_fps=20.0,              # 控制频率
-    enable_async=True              # 启用异步推理
+    enable_async=True,             # 启用异步推理
+    temporal_ensemble_coeff=None   # 通用时间集成系数，例如 0.01
 )
 ```
 
@@ -141,6 +143,9 @@ result = api.load_model(
 - `tokenizer_path` 当前只对 `PI0` 生效。
 - `SmolVLA` 会根据 checkpoint 配置解析基础 VLM 资产；离线运行时请设置
   `SMOLVLA_VLM_MODEL_PATH`。
+- `temporal_ensemble_coeff` 对所有 chunk policy 都可用。设置后会在每个控制步都
+  重新推理，并对重叠的未来动作做指数加权融合。该模式会自动关闭 async queue
+  预取。
 
 **返回值：**
 ```python
@@ -228,7 +233,6 @@ print(metadata.action_dim)
 status = api.get_status()
 print(status.is_loaded)
 print(status.queue_size)
-print(status.latency_estimate_ms)
 ```
 
 #### `get_model_info()`
@@ -364,7 +368,7 @@ api.unload_model()
 ## 错误处理
 
 ```python
-from inference_sdk import InferenceAPI, SDKError, ResourceStateError
+from inference_sdk import InferenceAPI
 
 api = InferenceAPI()
 
@@ -373,15 +377,10 @@ try:
         model_type="act",
         checkpoint_dir="/path/to/checkpoint"
     )
-    
     action = api.infer(images=images, state=state)
-    
-except ResourceStateError as e:
-    print(f"资源状态错误: {e}")
-except SDKError as e:
-    print(f"SDK 错误: {e.code} - {e.message}")
+
 except Exception as e:
-    print(f"未知错误: {e}")
+    print(f"错误: {type(e).__name__} - {e}")
 finally:
     api.unload_model()
 ```
@@ -397,4 +396,7 @@ finally:
 
 ## 完整示例
 
-参考 [examples/api_usage.py](../examples/api_usage.py) 查看更多示例。
+可以直接参考这两个示例入口：
+
+- [examples/api_usage.py](examples/api_usage.py)：基础 API 用法、离线 smoke test、控制环调用方式
+- [examples/act_alicia_m_real_robot.py](examples/act_alicia_m_real_robot.py)：ACT 接 Alicia-M-SDK 真机，读取头部/腕部相机并在闭环里执行 6 关节 + 夹爪动作

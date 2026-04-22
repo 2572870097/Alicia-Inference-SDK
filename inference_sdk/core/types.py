@@ -32,10 +32,10 @@ class PolicyStatus:
     is_loaded: bool
     model_type: str
     queue_size: int
-    latency_estimate_ms: float
     fallback_count: int
     required_cameras: List[str]
     requested_device: Optional[str] = None
     actual_device: Optional[str] = None
     device_warning: str = ""
     async_inference_enabled: bool = False
+    temporal_ensemble_enabled: bool = False

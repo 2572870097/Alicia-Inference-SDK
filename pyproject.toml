@@ -16,9 +16,14 @@ dependencies = [
 
 [project.optional-dependencies]
 act = [
+    "draccus==0.10.0",
     "omegaconf",
     "torch",
+    "torchvision",
+    "einops",
     "safetensors",
+    "huggingface-hub",
+    "packaging",
 ]
 pi0 = [
     "torch",
@@ -31,10 +36,15 @@ smolvla = [
     "safetensors",
 ]
 all = [
+    "draccus==0.10.0",
     "omegaconf",
     "torch",
+    "torchvision",
+    "einops",
     "transformers",
     "safetensors",
+    "huggingface-hub",
+    "packaging",
 ]
 
 [tool.setuptools]

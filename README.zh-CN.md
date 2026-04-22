@@ -136,7 +136,7 @@ SDK 的本地查找顺序：
 - `Observation`
 - `PolicyMetadata`
 - `PolicyStatus`
-- `SDKError` 及其子类
+- 标准 Python 异常（`ValueError`、`RuntimeError`、`ImportError`）
 
 已加载的 session 或策略实例提供以下核心运行方法：
 
@@ -167,7 +167,6 @@ from inference_sdk import (
     Observation,
     PolicyLoadConfig,
     RuntimeConfig,
-    SDKError,
 )
 
 config = PolicyLoadConfig(
@@ -200,8 +199,8 @@ try:
         print(action_chunk)
     finally:
         session.close()
-except SDKError as exc:
-    print(exc.code, exc.message, exc.details)
+except Exception as exc:
+    print(exc)
 ```
 
 如果要加载 `PI0`，请通过 `tokenizer_path` 或 `PI0_TOKENIZER_PATH` 提供
@@ -291,7 +290,6 @@ Observation(
 - `is_loaded`
 - `model_type`
 - `queue_size`
-- `latency_estimate_ms`
 - `fallback_count`
 - `required_cameras`
 - `requested_device`
@@ -323,36 +321,21 @@ Observation(
 
 ## 错误模型
 
-v1 SDK 使用结构化异常，而不是只返回字符串错误：
+v1 SDK 使用标准 Python 异常，而不是自定义异常层级：
 
-- `SDKError`
-- `ConfigurationError`
-- `ValidationError`
-- `CheckpointError`
-- `DependencyError`
-- `DeviceUnavailableError`
-- `ModelLoadError`
-- `InstructionNotSupportedError`
-- `ResourceStateError`
-- `InferenceError`
-- `InferenceTimeoutError`
-
-每个 `SDKError` 都暴露：
-
-- `code`
-- `message`
-- `details`
-- `recoverable`
+- `ValueError`：配置非法、输入校验失败、模型类型不支持、checkpoint 校验失败
+- `RuntimeError`：策略未加载、运行时状态异常、设备不可用、推理阶段失败
+- `ImportError`：缺少可选依赖
 
 示例：
 
 ```python
-from inference_sdk import SDKError, load_policy
+from inference_sdk import load_policy
 
 try:
     policy = load_policy(checkpoint_dir="/bad/path", model_type="act")
-except SDKError as exc:
-    print(exc.to_dict())
+except Exception as exc:
+    print(type(exc).__name__, exc)
 ```
 
 ## 运行时配置
@@ -365,7 +348,7 @@ from inference_sdk import RuntimeConfig
 runtime = RuntimeConfig(
     control_fps=30.0,
     enable_async_inference=True,
-    aggregate_fn_name="latest_only",
+    temporal_ensemble_coeff=None,
     fallback_mode="repeat",
 )
 ```
@@ -374,11 +357,8 @@ runtime = RuntimeConfig(
 
 - `control_fps`
 - `enable_async_inference`
-- `aggregate_fn_name`
+- `temporal_ensemble_coeff`
 - `fallback_mode`
-- `gripper_max_velocity`
-- `latency_ema_alpha`
-- `latency_safety_margin`
 - `obs_queue_maxsize`
 
 旧的 `SmoothingConfig` 仍然可用，但在 v1 中，推荐开发者优先使用
@@ -398,7 +378,7 @@ device = DeviceConfig(device="cuda:0")
 
 - 当前仅支持 `cpu`、`cuda` 和 `cuda:<index>`
 - 不受支持的设备字符串会在配置校验阶段直接报错
-- 如果请求的设备不可用，SDK 会直接抛出 `DeviceUnavailableError`
+- 如果请求的设备不可用，SDK 会抛出 `RuntimeError`
 
 ## 模型专项说明
 
@@ -420,15 +400,15 @@ device = DeviceConfig(device="cuda:0")
 
 ## 示例
 
-当前仓库只提供一个可直接运行的示例入口：
+当前仓库提供两个可直接运行的示例入口：
 
 - [`examples/api_usage.py`](examples/api_usage.py)
+- [`examples/act_alicia_m_real_robot.py`](examples/act_alicia_m_real_robot.py)
 
-这个脚本会演示：
+这些脚本分别演示：
 
-- 使用仓库内置的 ACT checkpoint 加载模型
-- 控制环风格的推理调用
-- PI0 运行前还需要 tokenizer 资产这类前置条件
+- `api_usage.py`：使用仓库内置 ACT checkpoint 做基础加载、控制环推理，以及 PI0/SmolVLA 的运行前准备提示
+- `act_alicia_m_real_robot.py`：将 ACT 推理接到 Alicia-M-SDK 真机控制环，采集头部/腕部相机图像并下发 6 关节 + 夹爪动作
 
 ## 仓库结构
 
@@ -438,7 +418,6 @@ inference_sdk/
   core/
     __init__.py
     config.py
-    exceptions.py
     types.py
   policy/
     __init__.py
@@ -459,7 +438,7 @@ pyproject.toml
 目录职责划分：
 
 - `inference_sdk/__init__.py`：稳定的开发者公开导入入口
-- `inference_sdk/core/`：共享配置对象、异常类型、数据结构
+- `inference_sdk/core/`：共享配置对象、数据结构
 - `inference_sdk/policy/`：各推理算法对应的策略实现
 - `inference_sdk/runtime/`：生命周期、设备选择、监控等运行时能力
 
@@ -474,3 +453,4 @@ pyproject.toml
 
 - [`INFERENCE_API_GUIDE.md`](INFERENCE_API_GUIDE.md)
 - [`examples/api_usage.py`](examples/api_usage.py)
+- [`examples/act_alicia_m_real_robot.py`](examples/act_alicia_m_real_robot.py)

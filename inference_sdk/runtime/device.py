@@ -4,8 +4,6 @@ from typing import Optional
 
 import torch
 
-from ..core.exceptions import DeviceUnavailableError
-
 logger = logging.getLogger(__name__)
 
 
@@ -60,7 +58,7 @@ def resolve_torch_device(requested_device: Optional[str] = None) -> DeviceSelect
             f"请求使用不受支持的设备 `{requested}`。"
             "当前仅支持 `cpu`、`cuda` 或 `cuda:<index>`。"
         )
-        raise DeviceUnavailableError(message)
+        raise ValueError(message)
 
     if requested == "cpu":
         return DeviceSelection(requested=requested, actual=requested)
@@ -73,7 +71,7 @@ def resolve_torch_device(requested_device: Optional[str] = None) -> DeviceSelect
                 message = (
                     f"请求使用 `{requested}`，但当前只检测到 {device_count} 张 CUDA 设备。"
                 )
-                raise DeviceUnavailableError(message)
+                raise RuntimeError(message)
 
             return DeviceSelection(requested=requested, actual=requested)
 
@@ -82,6 +80,6 @@ def resolve_torch_device(requested_device: Optional[str] = None) -> DeviceSelect
             f" torch.cuda.is_available()={torch.cuda.is_available()}，"
             f" torch.cuda.device_count()={device_count}。"
         )
-        raise DeviceUnavailableError(message)
+        raise RuntimeError(message)
 
     return DeviceSelection(requested=requested, actual=requested)

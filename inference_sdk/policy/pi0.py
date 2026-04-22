@@ -7,7 +7,7 @@ language-conditioned robot control.
 Implements action queue based inference:
 - Predicts chunk_size actions at once using flow matching denoising
 - Maintains action queue for smooth execution
-- Async prefetch and gripper smoothing via BaseInferenceEngine
+- Async prefetch via BaseInferenceEngine
 """
 
 import json
@@ -23,7 +23,6 @@ import numpy as np
 import torch
 import yaml
 
-from ..core.exceptions import ResourceStateError, ValidationError
 from ..runtime.base import BaseInferenceEngine, SmoothingConfig
 from ..runtime.device import resolve_torch_device
 
@@ -714,6 +713,35 @@ class PI0InferenceEngine(BaseInferenceEngine):
 
         return state_tensor.unsqueeze(0).to(self.device)
 
+    def build_inference_frame(self, images: Dict[str, np.ndarray], state: np.ndarray) -> Dict[str, Any]:
+        """Build the model-ready PI0 input frame from SDK observations."""
+        if self.config is None or self.config_dict is None:
+            raise RuntimeError("PI0 model config is not loaded")
+
+        if self._instruction_tokens is None or self._instruction_attention_mask is None:
+            raise RuntimeError("PI0 instruction is not set. Call set_instruction() first")
+
+        processed_images = self._preprocess_images(images)
+        processed_state = self._preprocess_state(state)
+
+        image_features = self.config_dict.get("image_features", [])
+        image_list = [processed_images[key] for key in image_features if key in processed_images]
+        if not image_list:
+            raise ValueError(
+                "No valid images available for PI0 inference: "
+                f"required_image_features={image_features}"
+            )
+
+        inference_frame: Dict[str, Any] = {
+            "images": image_list,
+            "img_masks": [torch.ones(1, dtype=torch.bool, device=self.device) for _ in image_list],
+            "lang_tokens": self._instruction_tokens,
+            "lang_masks": self._instruction_attention_mask,
+            "state": torch.zeros(1, self.config.max_state_dim, device=self.device),
+        }
+        inference_frame["state"][0, :processed_state.shape[1]] = processed_state[0]
+        return inference_frame
+
     def _postprocess_action(self, action_tensor: torch.Tensor) -> np.ndarray:
         """Postprocess PI0 normalized action tensor back to robot action space."""
         action = action_tensor.cpu()
@@ -739,36 +767,11 @@ class PI0InferenceEngine(BaseInferenceEngine):
         Returns:
             Action chunk (n_action_steps, action_dim) - unnormalized
         """
-        if self.model is None or self.config is None:
-            raise ResourceStateError("PI0 model is not loaded")
+        if self.model is None:
+            raise RuntimeError("PI0 model is not loaded")
 
-        if self._instruction_tokens is None or self._instruction_attention_mask is None:
-            raise ResourceStateError("PI0 instruction is not set. Call set_instruction() first")
-
-        processed_images = self._preprocess_images(images)
-        processed_state = self._preprocess_state(state)
-
-        image_features = self.config_dict.get("image_features", [])
-        image_list = [processed_images[key] for key in image_features if key in processed_images]
-        if not image_list:
-            raise ValidationError(
-                "No valid images available for PI0 inference",
-                details={"required_image_features": image_features},
-            )
-
-        image_masks = [torch.ones(1, dtype=torch.bool, device=self.device) for _ in image_list]
-
-        max_state_dim = self.config.max_state_dim
-        padded_state = torch.zeros(1, max_state_dim, device=self.device)
-        padded_state[0, :processed_state.shape[1]] = processed_state[0]
-
-        actions_chunk = self.model.sample_actions(
-            images=image_list,
-            img_masks=image_masks,
-            lang_tokens=self._instruction_tokens,
-            lang_masks=self._instruction_attention_mask,
-            state=padded_state,
-        )
+        inference_frame = self.build_inference_frame(images, state)
+        actions_chunk = self.model.sample_actions(**inference_frame)
 
         actions_normalized = actions_chunk[0, :self.n_action_steps, :self.action_dim]
         actions = np.stack(

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import cv2
-from inference_sdk import InferenceAPI, SDKError
+from inference_sdk import InferenceAPI
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -60,8 +60,8 @@ def load_model_with_help(api: InferenceAPI, **kwargs):
     model_type = kwargs.get("model_type", "unknown")
     try:
         return api.load_model(**kwargs)
-    except SDKError as exc:
-        print(f"加载模型失败: {exc.code} - {exc.message}")
+    except Exception as exc:
+        print(f"加载模型失败: {exc}")
         print_model_prerequisites(model_type)
         return None
 

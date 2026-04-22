@@ -142,7 +142,7 @@ Preferred v1 entry points:
 - `Observation`
 - `PolicyMetadata`
 - `PolicyStatus`
-- `SDKError` and subclasses
+- standard Python exceptions (`ValueError`, `RuntimeError`, `ImportError`)
 
 Core runtime methods on a loaded session or policy:
 
@@ -173,7 +173,6 @@ from inference_sdk import (
     Observation,
     PolicyLoadConfig,
     RuntimeConfig,
-    SDKError,
 )
 
 config = PolicyLoadConfig(
@@ -206,8 +205,8 @@ try:
         print(action_chunk)
     finally:
         session.close()
-except SDKError as exc:
-    print(exc.code, exc.message, exc.details)
+except Exception as exc:
+    print(exc)
 ```
 
 For `PI0`, pass tokenizer assets through `tokenizer_path` or
@@ -298,7 +297,6 @@ Runtime information returned by `policy.get_status()`:
 - `is_loaded`
 - `model_type`
 - `queue_size`
-- `latency_estimate_ms`
 - `fallback_count`
 - `required_cameras`
 - `requested_device`
@@ -330,36 +328,22 @@ Important runtime rules:
 
 ## Error Model
 
-The v1 SDK uses typed exceptions instead of only returning strings:
+The v1 SDK uses standard Python exceptions instead of a custom exception
+hierarchy:
 
-- `SDKError`
-- `ConfigurationError`
-- `ValidationError`
-- `CheckpointError`
-- `DependencyError`
-- `DeviceUnavailableError`
-- `ModelLoadError`
-- `InstructionNotSupportedError`
-- `ResourceStateError`
-- `InferenceError`
-- `InferenceTimeoutError`
-
-Every `SDKError` exposes:
-
-- `code`
-- `message`
-- `details`
-- `recoverable`
+- `ValueError` for invalid config, bad inputs, unsupported model types, and checkpoint validation failures
+- `RuntimeError` for unloaded policy state, unavailable runtime/device state, and inference-time failures
+- `ImportError` for missing optional dependencies
 
 Example:
 
 ```python
-from inference_sdk import SDKError, load_policy
+from inference_sdk import load_policy
 
 try:
     policy = load_policy(checkpoint_dir="/bad/path", model_type="act")
-except SDKError as exc:
-    print(exc.to_dict())
+except Exception as exc:
+    print(type(exc).__name__, exc)
 ```
 
 ## Runtime Configuration
@@ -372,7 +356,7 @@ from inference_sdk import RuntimeConfig
 runtime = RuntimeConfig(
     control_fps=30.0,
     enable_async_inference=True,
-    aggregate_fn_name="latest_only",
+    temporal_ensemble_coeff=None,
     fallback_mode="repeat",
 )
 ```
@@ -381,11 +365,8 @@ Key fields:
 
 - `control_fps`
 - `enable_async_inference`
-- `aggregate_fn_name`
+- `temporal_ensemble_coeff`
 - `fallback_mode`
-- `gripper_max_velocity`
-- `latency_ema_alpha`
-- `latency_safety_margin`
 - `obs_queue_maxsize`
 
 The legacy `SmoothingConfig` remains available, but `RuntimeConfig` is the
@@ -405,7 +386,7 @@ Behavior:
 
 - supported values are `cpu`, `cuda`, and `cuda:<index>`
 - unsupported device strings fail validation early
-- if the requested device is unavailable, the SDK raises `DeviceUnavailableError`
+- if the requested device is unavailable, the SDK raises `RuntimeError`
 
 ## Model-Specific Notes
 
@@ -427,15 +408,15 @@ Behavior:
 
 ## Examples
 
-The repository currently ships one runnable example entrypoint:
+The repository currently ships two runnable example entrypoints:
 
 - [`examples/api_usage.py`](examples/api_usage.py)
+- [`examples/act_alicia_m_real_robot.py`](examples/act_alicia_m_real_robot.py)
 
-That script demonstrates:
+Those scripts demonstrate:
 
-- ACT loading with the bundled sample checkpoint
-- control-loop style inference
-- PI0 runtime prerequisites such as tokenizer assets
+- `api_usage.py`: ACT loading with the bundled sample checkpoint, control-loop style inference, and PI0/SmolVLA runtime prerequisite hints
+- `act_alicia_m_real_robot.py`: wiring ACT inference into an Alicia-M real-robot loop with head/wrist cameras and 6-joint plus gripper execution via Alicia-M-SDK
 
 ## Repository Layout
 
@@ -445,7 +426,6 @@ inference_sdk/
   core/
     __init__.py
     config.py
-    exceptions.py
     types.py
   policy/
     __init__.py
@@ -466,7 +446,7 @@ pyproject.toml
 Package responsibilities:
 
 - `inference_sdk/__init__.py`: stable developer-facing import surface
-- `inference_sdk/core/`: shared config objects, exceptions, and data types
+- `inference_sdk/core/`: shared config objects and data types
 - `inference_sdk/policy/`: model-specific policy implementations
 - `inference_sdk/runtime/`: lifecycle, device resolution, and monitoring utilities
 
@@ -481,3 +461,4 @@ Package responsibilities:
 
 - [`INFERENCE_API_GUIDE.md`](INFERENCE_API_GUIDE.md)
 - [`examples/api_usage.py`](examples/api_usage.py)
+- [`examples/act_alicia_m_real_robot.py`](examples/act_alicia_m_real_robot.py)
